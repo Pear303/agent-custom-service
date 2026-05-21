@@ -1,0 +1,21 @@
+# 智能客服全栈部署
+version: "3.8"
+
+services:
+  agent-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./memory:/app/memory
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # langbot:
+  #   image: rockchin/langbot:latest
+  #   ports: ["5300:5300"]
+  #   volumes:
+  #     - ./langbot-data:/app/data
+  #   depends_on: [agent-api]
+  #   restart: unless-stopped

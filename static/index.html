@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 智能服务中心</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f7fa; color: #1a1a2e; }
+
+  .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 20px; font-weight: 600; }
+  .user-bar { font-size: 13px; opacity: 0.9; }
+  .user-bar input { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: #fff; padding: 4px 10px; border-radius: 6px; font-size: 13px; width: 160px; }
+  .user-bar input::placeholder { color: rgba(255,255,255,0.6); }
+
+  .tabs { display: flex; background: #fff; border-bottom: 1px solid #e2e8f0; }
+  .tab { flex: 1; padding: 14px; text-align: center; cursor: pointer; font-size: 15px; font-weight: 500; color: #64748b; border-bottom: 3px solid transparent; transition: all 0.2s; }
+  .tab:hover { color: #667eea; background: #f8fafc; }
+  .tab.active { color: #667eea; border-bottom-color: #667eea; background: #fff; }
+
+  .panel { display: none; max-width: 800px; margin: 0 auto; padding: 20px; }
+  .panel.active { display: block; }
+
+  /* 客服面板 */
+  .chat-container { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }
+  .chat-messages { height: 500px; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 75%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; }
+  .msg.user { align-self: flex-end; background: #667eea; color: #fff; border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: #f1f5f9; color: #1a1a2e; border-bottom-left-radius: 4px; }
+  .msg.bot .source { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+
+  .chat-input { display: flex; border-top: 1px solid #e2e8f0; padding: 12px; gap: 8px; }
+  .chat-input input { flex: 1; padding: 10px 14px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 14px; outline: none; }
+  .chat-input input:focus { border-color: #667eea; }
+  .chat-input button { padding: 10px 20px; background: #667eea; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+  .chat-input button:hover { background: #5a6fd6; }
+  .chat-input button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* 需求面板 */
+  .form-card { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 24px; }
+  .form-card h2 { font-size: 18px; margin-bottom: 4px; }
+  .form-card .subtitle { color: #64748b; font-size: 13px; margin-bottom: 24px; }
+  .form-group { margin-bottom: 18px; }
+  .form-group label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; color: #334155; }
+  .form-group label .req { color: #ef4444; }
+  .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 14px; outline: none; font-family: inherit; }
+  .form-group input:focus, .form-group textarea:focus, .form-group select:focus { border-color: #667eea; }
+  .form-group textarea { min-height: 120px; resize: vertical; }
+  .form-actions { display: flex; gap: 10px; margin-top: 24px; }
+  .btn-primary { padding: 10px 24px; background: #667eea; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+  .btn-primary:hover { background: #5a6fd6; }
+  .btn-secondary { padding: 10px 24px; background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; border-radius: 8px; cursor: pointer; font-size: 14px; }
+
+  .ticket-item { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 10px; cursor: pointer; transition: all 0.2s; }
+  .ticket-item:hover { border-color: #667eea; background: #fff; }
+  .ticket-item .header { display: flex; justify-content: space-between; align-items: center; }
+  .ticket-item .title { font-weight: 500; font-size: 15px; }
+  .ticket-item .meta { font-size: 12px; color: #64748b; margin-top: 4px; }
+  .ticket-item .status { font-size: 12px; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+  .status-queued { background: #fef3c7; color: #92400e; }
+  .status-analyzing { background: #dbeafe; color: #1e40af; }
+  .status-designing { background: #e0e7ff; color: #3730a3; }
+  .status-estimating { background: #f3e8ff; color: #6b21a8; }
+  .status-pending_development { background: #fef3c7; color: #92400e; }
+  .status-developing { background: #dbeafe; color: #1e40af; }
+  .status-development_completed { background: #d1fae5; color: #065f46; }
+  .status-development_failed { background: #fee2e2; color: #991b1b; }
+  .status-completed { background: #d1fae5; color: #065f46; }
+  .status-failed { background: #fee2e2; color: #991b1b; }
+
+  .progress-bar { height: 6px; background: #e2e8f0; border-radius: 3px; margin: 12px 0; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); transition: width 0.5s; }
+
+  .result-section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-top: 16px; }
+  .result-section h3 { font-size: 16px; margin-bottom: 8px; color: #334155; }
+  .result-section pre { background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; overflow-x: auto; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+  .toast { position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; color: #fff; font-size: 14px; z-index: 1000; transform: translateX(120%); transition: transform 0.3s; }
+  .toast.show { transform: translateX(0); }
+  .toast.success { background: #10b981; }
+  .toast.error { background: #ef4444; }
+
+  .typing { display: inline-flex; gap: 4px; padding: 8px 0; }
+  .typing span { width: 6px; height: 6px; background: #94a3b8; border-radius: 50%; animation: bounce 1.4s infinite; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-8px); } }
+
+  .need-redirect { background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 14px; margin-top: 8px; font-size: 13px; color: #92400e; }
+  .need-redirect a { color: #667eea; cursor: pointer; font-weight: 500; text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>AI 智能服务中心</h1>
+  <div class="user-bar">
+    用户ID: <input type="text" id="userId" placeholder="输入你的ID" value="">
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="chat">智能客服（未完成）</div>
+  <div class="tab" data-tab="requirement">需求对接</div>
+</div>
+
+<div class="panel active" id="panel-chat">
+  <div class="chat-container">
+    <div class="chat-messages" id="chatMessages">
+      <div class="msg bot">你好！智能客服助手现在尚未制作完成...<br><span class="source">系统</span></div>
+    </div>
+    <div class="chat-input">
+      <input type="text" id="chatInput" placeholder="输入你的问题..." autocomplete="off">
+      <button id="chatSend" onclick="sendChat()">发送</button>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-requirement">
+  <div class="form-card">
+    <h2>需求对接窗口</h2>
+    <p class="subtitle">描述你的项目需求，我们的 AI 团队会为你分析并给出初步方案。</p>
+    <div class="form-group">
+      <label>项目名称 <span class="req">*</span></label>
+      <input type="text" id="reqName" placeholder="例如：电商小程序">
+    </div>
+    <div class="form-group">
+      <label>项目类型</label>
+      <select id="reqType">
+        <option value="">请选择</option>
+        <option value="web">网站开发</option>
+        <option value="miniapp">小程序</option>
+        <option value="app">移动 App</option>
+        <option value="automation">自动化脚本</option>
+        <option value="data">数据分析</option>
+        <option value="ai">AI 应用</option>
+        <option value="other">其他</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>需求描述 <span class="req">*</span></label>
+      <textarea id="reqDesc" placeholder="请详细描述你的需求，包括目标用户、核心功能、预算范围等..."></textarea>
+    </div>
+    <div class="form-group">
+      <label>期望交付时间</label>
+      <select id="reqDeadline">
+        <option value="">请选择</option>
+        <option value="1week">1周内</option>
+        <option value="2weeks">2周内</option>
+        <option value="1month">1个月内</option>
+        <option value="3months">3个月内</option>
+        <option value="flexible">灵活</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>预算范围</label>
+      <select id="reqBudget">
+        <option value="">请选择</option>
+        <option value="5k">&lt; 5,000 元</option>
+        <option value="5k-20k">5,000 - 20,000 元</option>
+        <option value="20k-50k">20,000 - 50,000 元</option>
+        <option value="50k+">&gt; 50,000 元</option>
+        <option value="discuss">待商议</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn-primary" onclick="submitRequirement()">提交需求</button>
+      <button class="btn-secondary" onclick="clearForm()">清空</button>
+    </div>
+  </div>
+
+  <div class="form-card" style="margin-top: 20px;">
+    <h2>我的工单</h2>
+    <p class="subtitle">查看已提交的需求处理进度和结果。</p>
+    <div id="ticketList">
+      <p style="color: #64748b; text-align: center; padding: 20px;">暂无工单，请先提交需求。</p>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-ticket-detail">
+  <div class="form-card">
+    <button class="btn-secondary" onclick="switchTab('requirement')" style="margin-bottom: 16px;">← 返回工单列表</button>
+    <div id="ticketDetail"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API_BASE = location.origin;
+console.log('API Base URL:', API_BASE);
+
+let userId = localStorage.getItem('cs_user_id');
+if (!userId) {
+  userId = 'user_' + Date.now().toString(36);
+  localStorage.setItem('cs_user_id', userId);
+}
+document.getElementById('userId').value = userId;
+
+document.getElementById('userId').addEventListener('change', (e) => {
+  userId = e.target.value.trim() || userId;
+  localStorage.setItem('cs_user_id', userId);
+});
+
+// Tab 切换
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// 回车发送
+document.getElementById('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+
+function showToast(msg, type = 'success') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function addMessage(role, content, extra = '') {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = content + extra;
+  const container = document.getElementById('chatMessages');
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'msg bot';
+  div.id = 'typing-indicator';
+  div.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  document.getElementById('chatMessages').appendChild(div);
+  document.getElementById('chatMessages').scrollTop = document.getElementById('chatMessages').scrollHeight;
+}
+
+function hideTyping() {
+  const el = document.getElementById('typing-indicator');
+  if (el) el.remove();
+}
+
+async function sendChat() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  input.value = '';
+  document.getElementById('chatSend').disabled = true;
+  addMessage('user', msg.replace(/</g, '&lt;'));
+  showTyping();
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: userId, message: msg, stream: false }),
+    }, 30000);
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    hideTyping();
+
+    let extra = '';
+    if (data.source === 'dify') {
+      extra = '<span class="source">AI 客服</span>';
+      // 检测是否需要引导到需求 Tab
+      const needKeywords = ['需求', '项目', '开发', '做一个', '定制', '产品'];
+      if (needKeywords.some(k => msg.includes(k))) {
+        extra += '<div class="need-redirect">💡 听起来您有一个具体的项目想法。<a onclick="switchTab(\'requirement\')">切换到【需求对接】</a>，让我们的需求分析团队帮您梳理一下？</div>';
+      }
+    } else {
+      extra = '<span class="source">系统兜底</span>';
+    }
+    addMessage('bot', data.answer.replace(/</g, '&lt;').replace(/\n/g, '<br>'), extra);
+  } catch (err) {
+    hideTyping();
+    addMessage('bot', '抱歉，服务暂时不可用，请稍后重试。', '<span class="source">系统错误</span>');
+  }
+  document.getElementById('chatSend').disabled = false;
+  input.focus();
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  const tabEl = document.querySelector(`[data-tab="${name}"]`);
+  if (tabEl) tabEl.classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+}
+
+async function submitRequirement() {
+  const name = document.getElementById('reqName').value.trim();
+  const desc = document.getElementById('reqDesc').value.trim();
+  if (!name || !desc) { showToast('请填写项目名称和需求描述', 'error'); return; }
+
+  const payload = {
+    user_id: userId,
+    project_name: name,
+    project_type: document.getElementById('reqType').value,
+    description: desc,
+    deadline: document.getElementById('reqDeadline').value,
+    budget: document.getElementById('reqBudget').value,
+  };
+
+  try {
+    console.log('Submitting requirement to:', API_BASE + '/task/submit');
+    console.log('Payload:', payload);
+    
+    const resp = await fetchWithTimeout(API_BASE + '/task/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${errorText}`);
+    }
+    const data = await resp.json();
+    if (data.ticket_id) {
+      showToast('需求已提交！工单号: ' + data.ticket_id);
+      clearForm();
+      await loadTickets();
+    } else {
+      showToast('提交失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('网络错误，请稍后重试', 'error');
+  }
+}
+
+async function fetchWithTimeout(url, options = {}, timeout = 10000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return resp;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
+
+async function loadTickets() {
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/task/list?user_id=' + encodeURIComponent(userId), {}, 15000);
+    if (!resp.ok) {
+      console.warn('工单列表请求失败，状态码:', resp.status);
+      return;
+    }
+    const data = await resp.json();
+    const container = document.getElementById('ticketList');
+    
+    console.log('加载工单列表:', data);
+    console.log('工单数量:', data.tickets ? data.tickets.length : 0);
+    
+    if (!data.tickets || data.tickets.length === 0) {
+      container.innerHTML = '<p style="color: #64748b; text-align: center; padding: 20px;">暂无工单，请先提交需求。</p>';
+      return;
+    }
+
+    container.innerHTML = data.tickets.map(t => `
+      <div class="ticket-item" onclick="showTicketDetail('${t.ticket_id}')">
+        <div class="header">
+          <span class="title">${t.project_name || '未命名项目'}</span>
+          <span class="status status-${t.status}">${getStatusText(t.status)}</span>
+        </div>
+        <div class="meta">${t.ticket_id} · ${t.created_at || '未知时间'}</div>
+        <div class="progress-bar"><div class="progress-fill" style="width: ${Math.max(0, t.progress || 0)}%"></div></div>
+        ${t.status === 'pending_development' ? '<div style="font-size: 12px; color: #92400e; margin-top: 4px;">⚠️ 需求分析完成，请查看详情并确认是否开始开发</div>' : ''}
+        ${t.error ? `<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">错误：${t.error}</div>` : ''}
+        ${t.development_error ? `<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">开发错误：${t.development_error}</div>` : ''}
+      </div>
+    `).join('');
+    
+    console.log('工单列表渲染完成');
+  } catch (err) {
+    console.error('加载工单失败:', err);
+    document.getElementById('ticketList').innerHTML = '<p style="color: #ef4444; text-align: center; padding: 20px;">加载工单失败，请刷新页面重试。</p>';
+  }
+}
+
+function getStatusText(status) {
+  const map = {
+    queued: '排队中',
+    analyzing: '需求分析中',
+    designing: 'PRD 设计中',
+    estimating: '成本估算中',
+    pending_development: '待确认开发',
+    developing: '开发中',
+    development_completed: '开发完成',
+    development_failed: '开发失败',
+    completed: '已完成',
+    failed: '处理失败'
+  };
+  return map[status] || status;
+}
+
+async function showTicketDetail(ticketId) {
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/task/' + ticketId + '/status', {}, 15000);
+    if (!resp.ok) {
+      showToast('加载工单详情失败', 'error');
+      return;
+    }
+    const ticket = await resp.json();
+    
+    if (ticket.error && !ticket.analysis) {
+      showToast(ticket.error, 'error');
+      return;
+    }
+
+    const container = document.getElementById('ticketDetail');
+    
+    // 开发按钮：仅在 pending_development 或 development_failed 状态显示
+    const devButton = (ticket.status === 'pending_development' || ticket.status === 'development_failed') 
+      ? `<button class="btn-primary" onclick="startDevelopment('${ticket.ticket_id}')" style="margin-top: 16px; width: 100%;">🚀 开始开发</button>`
+      : '';
+    
+    // 开发中提示
+    const developingHint = ticket.status === 'developing'
+      ? '<div style="background: #dbeafe; border: 1px solid #3b82f6; border-radius: 8px; padding: 12px; margin-top: 16px; color: #1e40af;">⚙️ 开发进行中，请稍候...</div>'
+      : '';
+    
+    // 开发结果
+    const devOutput = ticket.development_output 
+      ? `
+        <div class="result-section">
+          <h3>💻 开发结果</h3>
+          ${ticket.development_output.project_structure ? `<h4>项目结构</h4><pre>${ticket.development_output.project_structure}</pre>` : ''}
+          ${ticket.development_output.tech_stack ? `<h4>技术栈</h4><pre>${JSON.stringify(ticket.development_output.tech_stack, null, 2)}</pre>` : ''}
+          ${ticket.development_output.setup_instructions ? `<h4>安装与运行</h4><pre>${ticket.development_output.setup_instructions}</pre>` : ''}
+          ${ticket.development_output.files ? `<h4>生成的文件 (${ticket.development_output.files.length} 个)</h4><pre>${JSON.stringify(ticket.development_output.files.map(f => f.path), null, 2)}</pre>` : ''}
+        </div>
+      `
+      : '';
+    
+    // 开发错误
+    const devError = ticket.development_error
+      ? `<div class="result-section" style="border-color: #fee2e2; background: #fef2f2;"><h3 style="color: #991b1b;">❌ 开发错误</h3><pre>${ticket.development_error}</pre></div>`
+      : '';
+
+    container.innerHTML = `
+      <h2>${ticket.project_name || '未命名项目'}</h2>
+      <p class="subtitle">工单号: ${ticket.ticket_id} · 状态: ${getStatusText(ticket.status)}</p>
+      
+      <div class="progress-bar"><div class="progress-fill" style="width: ${Math.max(0, ticket.progress || 0)}%"></div></div>
+      <p style="text-align: center; font-size: 13px; color: #64748b;">处理进度: ${ticket.progress || 0}%</p>
+
+      ${ticket.analysis ? `
+        <div class="result-section">
+          <h3>📋 需求分析</h3>
+          <pre>${JSON.stringify(ticket.analysis, null, 2)}</pre>
+        </div>
+      ` : '<p style="color: #64748b; margin-top: 16px;">需求分析尚未完成...</p>'}
+
+      ${ticket.prd ? `
+        <div class="result-section">
+          <h3>📝 产品需求文档 (PRD)</h3>
+          <pre>${JSON.stringify(ticket.prd, null, 2)}</pre>
+        </div>
+      ` : ''}
+
+      ${ticket.quote ? `
+        <div class="result-section">
+          <h3>💰 成本估算</h3>
+          <pre>${JSON.stringify(ticket.quote, null, 2)}</pre>
+        </div>
+      ` : ''}
+
+      ${devButton}
+      ${developingHint}
+      ${devOutput}
+      ${devError}
+
+      ${ticket.error && !ticket.development_error ? `
+        <div class="result-section" style="border-color: #fee2e2; background: #fef2f2;">
+          <h3 style="color: #991b1b;">❌ 错误信息</h3>
+          <pre>${ticket.error}</pre>
+        </div>
+      ` : ''}
+
+      <p style="font-size: 12px; color: #94a3b8; margin-top: 16px;">
+        创建时间: ${ticket.created_at || '未知'} · 更新时间: ${ticket.updated_at || '未知'}
+      </p>
+    `;
+
+    switchTab('ticket-detail');
+  } catch (err) {
+    console.error('加载工单详情失败:', err);
+    showToast('加载失败，请稍后重试', 'error');
+  }
+}
+
+async function startDevelopment(ticketId) {
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/task/' + ticketId + '/start-development', {
+      method: 'POST',
+    }, 30000);
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    
+    if (data.status === 'developing') {
+      showToast('开发已启动，正在生成代码...', 'success');
+      // 刷新详情
+      showTicketDetail(ticketId);
+    } else {
+      showToast(data.error || '启动开发失败', 'error');
+    }
+  } catch (err) {
+    console.error('启动开发失败:', err);
+    showToast('网络错误，请稍后重试', 'error');
+  }
+}
+
+// 每 5 秒自动刷新工单列表
+setInterval(loadTickets, 5000);
+window.addEventListener('load', loadTickets);
+
+// 页面加载后检查服务状态（带超时）
+async function checkHealth() {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(API_BASE + '/health', { signal: controller.signal });
+    clearTimeout(timeout);
+    if (resp.ok) {
+      console.log('服务健康检查通过');
+    }
+  } catch (e) {
+    console.warn('服务不可达或超时');
+  }
+}
+window.addEventListener('load', checkHealth);
+
+function clearForm() {
+  document.getElementById('reqName').value = '';
+  document.getElementById('reqType').value = '';
+  document.getElementById('reqDesc').value = '';
+  document.getElementById('reqDeadline').value = '';
+  document.getElementById('reqBudget').value = '';
+}
+</script>
+</body>
+</html>

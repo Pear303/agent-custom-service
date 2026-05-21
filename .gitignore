@@ -1,0 +1,63 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# 个人自学
+memory/
+learning/
+
+# 用户项目产出物
+users/
+
+# IDE / 编辑器配置
+.vscode/
+.sisyphus/
+
+# 依赖包，缓存
+node_modules/
+.pytest_cache/
+*.egg-info/
+
+# Python 构建产物
+dist/
+build/
+
+# 临时目录
+-p/
+
+# 工程临时输出
+node-output.txt
+*.log
+
+# 临时工具脚本
+build-ppt.js
+check_ppt.py
+fix_slides.py
+shrink_slides.py
+test-browser.js
+
+# ── 第三方技能（版权限制，不随仓库分发） ──
+# Anthropic 专有（pdf/pptx/xlsx 为 AI 工具内建，不可提取分发）
+skills/pdf/
+skills/pptx/
+skills/xlsx/
+
+# ClawHub 安装的第三方技能（All Rights Reserved，版权归原作者）
+skills/agent-browser*/
+skills/auto-updater*/
+skills/ddg-web-search*/
+skills/find-skills*/
+skills/ontology*/
+skills/self-improving-agent*/
+skills/ui-ux-pro-max*/
+skills/word-docx*/
+
+# 文本向量化
+model/
+embeddings/
+data/
+vector_store/
+requirements.txt.new

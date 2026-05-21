@@ -1,0 +1,490 @@
+"""Agent 服务：Dify 路由 + 兜底 Agent 逻辑 + 需求分析"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import AsyncGenerator
+
+from openai import AsyncOpenAI
+
+from .session_manager import SessionManager, Session
+from services.dify import DifyChatflowClient
+from agent.factory import create_agent
+from agent.lc_tools import set_workspace, set_skills_loader, set_todo_store, set_subagent_deps, set_user_id, set_ticket_id, clear_context, _build_workspace
+
+logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).parent.parent
+
+_AGENT_CONCURRENCY_LIMIT = 5
+_agent_semaphore = asyncio.Semaphore(_AGENT_CONCURRENCY_LIMIT)
+
+_MAX_RETRIES = 2
+_RETRY_DELAY = 1.0
+
+
+def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, output_subdir=None):
+    """在线程中设置上下文变量 (ContextVar) 后执行调用。
+
+    asyncio.to_thread 不会自动复制上下文变量，因此必须在新线程中显式设置。
+    workspace 参数代表项目根目录，此函数会将其重置为完整的目标路径。
+    output_subdir: 可选的子目录（例如 "成品"），将追加到目标路径末尾。
+    """
+    effective_ws = _build_workspace(workspace, user_id, ticket_id)
+    if output_subdir:
+        effective_ws = effective_ws / output_subdir
+        effective_ws.mkdir(parents=True, exist_ok=True)
+    set_workspace(effective_ws)
+    set_user_id(user_id)
+    set_ticket_id(ticket_id)
+    try:
+        return _invoke_with_retry(executor, input_data)
+    finally:
+        clear_context()
+
+
+def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
+    """带有重试机制的同步执行器调用。
+
+    Args:
+        executor: AgentExecutor 实例
+        input_data: 输入数据字典
+        max_retries: 最大重试次数
+
+    Returns:
+        执行结果字典
+
+    Raises:
+        若所有重试均失败，则抛出最后一次捕获的异常
+    """
+    import time
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return executor.invoke(input_data)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                logger.warning("第 %d 次尝试失败，%0.1f 秒后重试: %s", attempt + 1, _RETRY_DELAY, exc)
+                time.sleep(_RETRY_DELAY)
+    raise last_exc
+
+REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
+
+收到客户需求后，按以下维度分析：
+
+1. **项目概述**：一句话概括项目本质
+2. **目标用户**：谁会使用这个产品
+3. **核心功能**：3-5 个最关键的功能点
+4. **非功能需求**：性能、安全、兼容性等
+5. **约束条件**：预算、时间、技术限制
+6. **风险点**：可能的技术或业务风险
+7. **待澄清问题**：需要客户补充的信息
+
+最后输出结构化需求简报（JSON 格式），并给出复杂度评估（简单/中等/复杂）。"""
+
+PRODUCT_MANAGER_PROMPT = """你是产品经理，负责将需求分析转化为完整的产品需求文档（PRD）。
+
+收到需求分析后，按以下维度设计：
+
+1. **产品定位**：一句话描述产品价值和差异化
+2. **功能清单**：按优先级排序（P0 核心/P1 重要/P2 锦上添花）
+3. **用户故事**：3-5 个核心用户场景的完整描述
+4. **信息架构**：主要页面和导航结构
+5. **数据模型**：核心数据实体和关系
+6. **验收标准**：每个 P0 功能的完成定义
+
+最后输出 PRD（JSON 格式），包含功能总数、核心场景数和技术复杂度评估。"""
+
+COST_ESTIMATOR_PROMPT = """你是成本估算师，负责根据需求分析和 PRD 计算开发成本和报价。
+
+收到 PRD 后，按以下维度估算：
+
+1. **人力成本**：前端/后端/UI/测试/项目管理的工时 × 单价
+2. **基础设施成本**：服务器/云服务/第三方 API
+3. **风险缓冲**：15% 应急预算
+4. **利润空间**：25% 合理利润
+
+最后输出报价单（JSON 格式），包含：
+- 总报价（元）
+- 分项明细
+- 付款节点（如 3-4-3）
+- 交付周期（周）
+- 售后支持期限（月）"""
+
+
+class AgentService:
+    def __init__(self, session_manager: SessionManager):
+        self.session_manager = session_manager
+        self._dify: DifyChatflowClient | None = None
+        self._llm: AsyncOpenAI | None = None
+
+    async def _get_dify(self) -> DifyChatflowClient:
+        if self._dify is None:
+            self._dify = DifyChatflowClient()
+        return self._dify
+
+    def _get_llm(self) -> AsyncOpenAI:
+        if self._llm is None:
+            self._llm = AsyncOpenAI(
+                api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+                base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            )
+        return self._llm
+
+    async def chat(self, user_id: str, message: str) -> dict:
+        session = await self.session_manager.get_or_create_async(user_id)
+        dify = await self._get_dify()
+
+        try:
+            resp = await dify.chat(
+                query=message,
+                user_id=user_id,
+                conversation_id=session.conversation_id,
+            )
+            session.conversation_id = resp.get("conversation_id")
+            await self.session_manager._save_session(session)
+            return {
+                "user_id": user_id,
+                "answer": resp.get("answer", ""),
+                "conversation_id": resp.get("conversation_id"),
+                "source": "dify",
+            }
+        except Exception as exc:
+            logger.warning("Dify 调用失败，使用兜底 Agent: %s", exc)
+            return await self._fallback(user_id, message)
+
+    async def chat_stream(self, user_id: str, message: str) -> AsyncGenerator[str, None]:
+        session = await self.session_manager.get_or_create_async(user_id)
+        dify = await self._get_dify()
+
+        try:
+            async for chunk in dify.chat_stream(
+                query=message,
+                user_id=user_id,
+                conversation_id=session.conversation_id,
+            ):
+                event = chunk.get("event")
+                if event == "message":
+                    yield json.dumps({
+                        "event": "message",
+                        "answer": chunk.get("answer", ""),
+                        "source": "dify",
+                    }) + "\n"
+                elif event == "message_end":
+                    session.conversation_id = chunk.get("conversation_id")
+                    await self.session_manager._save_session(session)
+                    yield json.dumps({
+                        "event": "message_end",
+                        "conversation_id": chunk.get("conversation_id"),
+                    }) + "\n"
+                    return
+                elif event == "error":
+                    raise RuntimeError(chunk.get("message", "Dify stream error"))
+        except Exception as exc:
+            logger.warning("Dify 流式调用失败，使用兜底 Agent: %s", exc)
+            fallback_answer = await self._fallback(user_id, message)
+            yield json.dumps({
+                "event": "message",
+                "answer": fallback_answer["answer"],
+                "source": "agent",
+            }) + "\n"
+            yield json.dumps({"event": "message_end"}) + "\n"
+
+    async def analyze_requirement(self, user_id: str, requirement: dict, ticket_id: str | None = None) -> dict:
+        """需求分析：将客户需求转化为结构化需求简报"""
+        async with _agent_semaphore:
+            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            set_workspace(agent.root)
+            set_user_id(user_id)
+            set_ticket_id(ticket_id)
+            set_skills_loader(agent.skills)
+            set_todo_store(agent.todo_store)
+            set_subagent_deps(agent.llm, agent.sub_reg)
+
+            prompt = f"""基于以下客户需求，按要求输出 JSON 格式的需求分析结果：
+
+{json.dumps(requirement, ensure_ascii=False, indent=2)}
+
+请严格按照以下系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{REQUIREMENT_ANALYST_PROMPT}"""
+
+            try:
+                result = await asyncio.to_thread(
+                    _invoke_in_thread,
+                    agent.root, user_id, ticket_id,
+                    agent.executor,
+                    {"input": prompt, "chat_history": []},
+                )
+                content = result["output"]
+                if "</think>" in content:
+                    content = content.split("</think>", 1)[1].strip()
+                
+                # 提取 JSON 内容
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    content = content[json_start:json_end]
+                else:
+                    logger.error("需求分析响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                    return {"status": "failed", "error": "需求分析响应格式无效"}
+                
+                data = json.loads(content)
+                return {"status": "completed", "data": data}
+            except json.JSONDecodeError as exc:
+                logger.error("需求分析 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                return {"status": "failed", "error": f"需求分析格式错误: {str(exc)}"}
+            except Exception as exc:
+                logger.error("需求分析失败: %s", exc)
+                return {"status": "failed", "error": str(exc)}
+            finally:
+                clear_context()
+
+    async def design_prd(self, user_id: str, analysis: dict, ticket_id: str | None = None) -> dict:
+        async with _agent_semaphore:
+            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            set_workspace(agent.root)
+            set_user_id(user_id)
+            set_ticket_id(ticket_id)
+            set_skills_loader(agent.skills)
+            set_todo_store(agent.todo_store)
+            set_subagent_deps(agent.llm, agent.sub_reg)
+
+            prompt = f"""基于以下需求分析结果，按要求输出 JSON 格式的 PRD：
+
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+
+请严格按照以下系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{PRODUCT_MANAGER_PROMPT}"""
+
+            try:
+                result = await asyncio.to_thread(
+                    _invoke_in_thread,
+                    agent.root, user_id, ticket_id,
+                    agent.executor,
+                    {"input": prompt, "chat_history": []},
+                )
+                content = result["output"]
+                if "</think>" in content:
+                    content = content.split("</think>", 1)[1].strip()
+                
+                # 提取 JSON 内容（处理 LLM 可能返回的额外文本）
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    content = content[json_start:json_end]
+                else:
+                    logger.error("PRD 响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                    return {"status": "failed", "error": "PRD 响应格式无效"}
+                
+                data = json.loads(content)
+                return {"status": "completed", "data": data}
+            except json.JSONDecodeError as exc:
+                logger.error("PRD JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                return {"status": "failed", "error": f"PRD 格式错误: {str(exc)}"}
+            except Exception as exc:
+                logger.error("PRD 设计失败: %s", exc)
+                return {"status": "failed", "error": str(exc)}
+            finally:
+                clear_context()
+
+    async def estimate_cost(self, user_id: str, prd: dict, analysis: dict, ticket_id: str | None = None) -> dict:
+        async with _agent_semaphore:
+            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            set_workspace(agent.root)
+            set_user_id(user_id)
+            set_ticket_id(ticket_id)
+            set_skills_loader(agent.skills)
+            set_todo_store(agent.todo_store)
+            set_subagent_deps(agent.llm, agent.sub_reg)
+
+            combined = {**prd, **analysis}
+            prompt = f"""基于以下 PRD 和需求分析，按要求输出 JSON 格式的成本估算：
+
+{json.dumps(combined, ensure_ascii=False, indent=2)}
+
+请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{COST_ESTIMATOR_PROMPT}"""
+
+            try:
+                result = await asyncio.to_thread(
+                    _invoke_in_thread,
+                    agent.root, user_id, ticket_id,
+                    agent.executor,
+                    {"input": prompt, "chat_history": []},
+                )
+                content = result["output"]
+                if "</think>" in content:
+                    content = content.split("</think>", 1)[1].strip()
+                
+                # 提取 JSON 内容（处理 LLM 可能返回的额外文本）
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    content = content[json_start:json_end]
+                else:
+                    logger.error("成本估算响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                    return {"status": "failed", "error": "成本估算响应格式无效"}
+                
+                data = json.loads(content)
+                return {"status": "completed", "data": data}
+            except json.JSONDecodeError as exc:
+                logger.error("成本估算 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                return {"status": "failed", "error": f"成本估算格式错误: {str(exc)}"}
+            except Exception as exc:
+                logger.error("成本估算失败: %s", exc)
+                return {"status": "failed", "error": str(exc)}
+            finally:
+                clear_context()
+
+    DEVELOPER_PROMPT = """你是全栈开发工程师，负责根据产品需求文档（PRD）生成完整的项目代码。
+
+收到 PRD 后，按以下维度生成代码：
+
+1. **项目结构**：合理的目录组织
+2. **核心代码**：实现所有 P0/P1 功能
+3. **配置文件**：package.json / requirements.txt 等
+4. **README**：项目说明和运行指南
+
+最后输出开发结果（JSON 格式），包含：
+- project_structure: 项目目录结构（树形文本）
+- files: 生成的文件列表（路径 + 内容）
+- tech_stack: 使用的技术栈
+- setup_instructions: 安装和运行步骤"""
+
+    async def develop_project(self, user_id: str, project_data: dict, ticket_id: str | None = None) -> dict:
+        async with _agent_semaphore:
+            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            set_workspace(agent.root)
+            set_user_id(user_id)
+            set_ticket_id(ticket_id)
+            set_skills_loader(agent.skills)
+            set_todo_store(agent.todo_store)
+            set_subagent_deps(agent.llm, agent.sub_reg)
+
+            prompt = f"""基于以下项目数据，按要求输出 JSON 格式的开发结果：
+
+{json.dumps(project_data, ensure_ascii=False, indent=2)}
+
+请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{self.DEVELOPER_PROMPT}"""
+
+            try:
+                # 使用 asyncio.to_thread 避免阻塞事件循环
+                result = await asyncio.to_thread(
+                    _invoke_in_thread,
+                    agent.root, user_id, ticket_id,
+                    agent.executor,
+                    {"input": prompt, "chat_history": []},
+                    "成品",
+                )
+                content = result["output"]
+                if "</think>" in content:
+                    content = content.split("</think>", 1)[1].strip()
+                
+                # 提取 JSON 内容
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    content = content[json_start:json_end]
+                else:
+                    logger.error("开发响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                    return {"status": "failed", "error": "开发响应格式无效"}
+                
+                # 尝试修复常见的 JSON 格式问题
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    # 尝试修复：移除尾随逗号
+                    import re
+                    fixed_content = re.sub(r',\s*([}\]])', r'\1', content)
+                    data = json.loads(fixed_content)
+
+                # 将 LLM 生成的代码文件写入 data/users/{user_id}/{ticket_id}/成品/
+                files = data.get("files")
+                if files and isinstance(files, list) and ticket_id:
+                    output_root = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "成品"
+                    saved_count = 0
+                    for entry in files:
+                        if not isinstance(entry, dict):
+                            continue
+                        file_path = entry.get("path") or entry.get("file") or entry.get("name")
+                        file_content = entry.get("content") or entry.get("code") or ""
+                        if not file_path or not file_content:
+                            continue
+                        target = output_root / file_path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(file_content, encoding="utf-8")
+                        saved_count += 1
+                    if saved_count > 0:
+                        logger.info("开发成品已保存 %d 个文件到 %s", saved_count, output_root)
+                        data["_output_dir"] = str(output_root)
+                        data["_file_count"] = saved_count
+
+                return {"status": "completed", "data": data}
+            except json.JSONDecodeError as exc:
+                logger.error("开发 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                return {"status": "failed", "error": f"开发格式错误: {str(exc)}"}
+            except Exception as exc:
+                logger.error("开发失败: %s", exc)
+                return {"status": "failed", "error": str(exc)}
+            finally:
+                clear_context()
+
+    async def _call_llm(self, system_prompt: str, input_data: dict) -> dict:
+        llm = self._get_llm()
+        prompt = f"""基于以下输入数据，按要求输出 JSON 格式结果：
+
+{json.dumps(input_data, ensure_ascii=False, indent=2)}
+
+请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。"""
+
+        try:
+            resp = await llm.chat.completions.create(
+                model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+            )
+            content = resp.choices[0].message.content.strip()
+            if "</think>" in content:
+                content = content.split("</think>", 1)[1].strip()
+            
+            # 提取 JSON 内容（处理 LLM 可能返回的额外文本）
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                logger.error("LLM 响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                return {"status": "failed", "error": "LLM 响应格式无效"}
+            
+            result = json.loads(content)
+            return {"status": "completed", "data": result}
+        except json.JSONDecodeError as exc:
+            logger.error("LLM JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+            return {"status": "failed", "error": f"LLM 格式错误: {str(exc)}"}
+        except Exception as exc:
+            logger.error("LLM 调用失败: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+
+    async def _fallback(self, user_id: str, message: str) -> dict:
+        return {
+            "user_id": user_id,
+            "answer": f"抱歉，智能客服系统暂时不可用。您的问题是：「{message}」，已转人工处理。",
+            "conversation_id": None,
+            "source": "agent",
+        }

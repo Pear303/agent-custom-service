@@ -99,7 +99,11 @@ def _resolve(path: str) -> Path:
 
     if workspace is not None:
         if p.is_absolute():
-            p = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(".")
+            _project_root = Path(__file__).parent.parent
+            try:
+                p = p.relative_to(_project_root)
+            except ValueError:
+                p = Path(p.name)
         return (workspace / p).resolve()
 
     import logging as _logging

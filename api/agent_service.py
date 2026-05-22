@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -26,17 +27,97 @@ _MAX_RETRIES = 2
 _RETRY_DELAY = 1.0
 
 
+def _parse_json_safe(content: str, _debug_label: str = "") -> dict | None:
+    if "</think>" in content:
+        content = content.split("</think>", 1)[1].strip()
+
+    strategies = [
+        lambda c: json.loads(c),
+        lambda c: json.loads(re.sub(r',\s*([}\]])', r'\1', c)),
+        lambda c: _try_truncated_json(c),
+        lambda c: json.loads(re.sub(r'(?m)^```(?:json)?\s*\n?|^\s*```\s*$', '', c).strip()),
+        lambda c: json.loads(re.sub(r"(?<!\\)'", '"', c)),
+        lambda c: _try_truncated_json(re.sub(r"(?<!\\)'", '"', c)),
+    ]
+    for _ in strategies:
+        try:
+            return _(content)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+    _dump_debug_json(content, _debug_label)
+    return None
+
+
+def _dump_debug_json(content: str, label: str = "") -> None:
+    debug_dir = _PROJECT_ROOT / "data" / "_json_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_label = re.sub(r"[^\w一-龥]", "_", label)[:40] if label else "unknown"
+    filepath = debug_dir / f"parse_fail_{ts}_{safe_label}.json"
+    filepath.write_text(content, encoding="utf-8")
+    logger.warning("废弃 JSON 已保存到 %s (%d 字节)", filepath, len(content))
+
+
+def _try_truncated_json(content: str) -> dict:
+    start = content.find('{')
+    if start == -1:
+        start = content.find('[')
+        close_char = ']'
+        open_char = '['
+    else:
+        close_char = '}'
+        open_char = '{'
+    bracket_open = '['
+    bracket_close = ']'
+    if start == -1:
+        raise json.JSONDecodeError("No opening brace/bracket found", content, 0)
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        if e.pos > 0 and "Extra data" in str(e):
+            try:
+                return json.loads(content[:e.pos])
+            except json.JSONDecodeError:
+                pass
+
+    for end in range(len(content) - 1, start, -1):
+        if content[end] == close_char:
+            try:
+                return json.loads(content[start:end + 1])
+            except json.JSONDecodeError:
+                continue
+
+    depth = {close_char: 0, bracket_close: 0}
+    for ch in content[start:]:
+        if ch == open_char:
+            depth[close_char] += 1
+        elif ch == close_char:
+            depth[close_char] = max(0, depth[close_char] - 1)
+        elif ch == bracket_open:
+            depth[bracket_close] += 1
+        elif ch == bracket_close:
+            depth[bracket_close] = max(0, depth[bracket_close] - 1)
+    suffix = bracket_close * depth[bracket_close] + close_char * depth[close_char]
+    if suffix:
+        return json.loads(content[start:] + suffix)
+
+    raise json.JSONDecodeError("No valid JSON found in truncated content", content, 0)
+
+
 def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, output_subdir=None):
     """在线程中设置上下文变量 (ContextVar) 后执行调用。
 
     asyncio.to_thread 不会自动复制上下文变量，因此必须在新线程中显式设置。
     workspace 参数代表项目根目录，此函数会将其重置为完整的目标路径。
-    output_subdir: 可选的子目录（例如 "成品"），将追加到目标路径末尾。
+    output_subdir: 非空时使用 _build 临时目录作为 workspace，
+                   避免 LLM 的 write_file 与最终输出目录冲突导致路径嵌套。
     """
     effective_ws = _build_workspace(workspace, user_id, ticket_id)
     if output_subdir:
-        effective_ws = effective_ws / output_subdir
-        effective_ws.mkdir(parents=True, exist_ok=True)
+        # 使用 _build 临时目录：LLM 在此自由操作，不会污染最终输出目录
+        effective_ws = effective_ws / "_build"
+    effective_ws.mkdir(parents=True, exist_ok=True)
     set_workspace(effective_ws)
     set_user_id(user_id)
     set_ticket_id(ticket_id)
@@ -71,6 +152,58 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
                 logger.warning("第 %d 次尝试失败，%0.1f 秒后重试: %s", attempt + 1, _RETRY_DELAY, exc)
                 time.sleep(_RETRY_DELAY)
     raise last_exc
+
+def _clean_output_path(file_path: str, user_id: str, ticket_id: str) -> Path:
+    """清理文件路径，反复剥离所有可能的嵌套前缀，防止路径二次拼接。
+
+    LLM 返回的 file_path 可能携带各种前缀：
+    - 完整的绝对路径（F:\\...\\data\\users\\...\\成品\\...）
+    - data/users/{uid}/{tid}/成品/ 前缀（已在 output_root 中）
+    - _build/ 前缀（临时 workspace）
+    - output/ 前缀
+    - data/ 前缀
+
+    此函数反复剥离这些前缀直到路径不再变化，确保最终路径是纯粹的相对路径。
+    """
+    p = Path(file_path)
+
+    # 如果是绝对路径，先相对于项目根目录消去
+    if p.is_absolute():
+        try:
+            p = p.relative_to(_PROJECT_ROOT)
+        except ValueError:
+            p = Path(p.name)
+
+    # 可能反复出现的嵌套前缀，按从具体到笼统排列
+    nesting_prefixes = [
+        Path("data") / "users" / user_id / ticket_id / "成品",
+        Path("data") / "users" / user_id / ticket_id / "_build",
+        Path("data") / "users" / user_id / ticket_id,
+        Path("data") / "users" / user_id,
+        Path("data") / "users",
+        Path("data"),
+        Path("output"),
+        Path("_build"),
+    ]
+
+    # 反复剥离直到路径不再变化（处理多重嵌套）
+    changed = True
+    while changed and len(p.parts) > 1:
+        changed = False
+        for prefix in nesting_prefixes:
+            try:
+                stripped = p.relative_to(prefix)
+                if stripped != p:
+                    p = stripped
+                    changed = True
+                    break
+            except ValueError:
+                continue
+
+    # 去除首尾的路径分隔符
+    clean = str(p).lstrip("/\\").rstrip("/\\")
+    return Path(clean) if clean else p
+
 
 REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
 
@@ -234,10 +367,12 @@ class AgentService:
                     logger.error("需求分析响应中未找到 JSON 内容，原始输出: %s", content[:200])
                     return {"status": "failed", "error": "需求分析响应格式无效"}
                 
-                data = json.loads(content)
+                data = _parse_json_safe(content)
+                if data is None:
+                    raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
                 return {"status": "completed", "data": data}
             except json.JSONDecodeError as exc:
-                logger.error("需求分析 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                logger.error("需求分析 JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
                 return {"status": "failed", "error": f"需求分析格式错误: {str(exc)}"}
             except Exception as exc:
                 logger.error("需求分析失败: %s", exc)
@@ -284,10 +419,12 @@ class AgentService:
                     logger.error("PRD 响应中未找到 JSON 内容，原始输出: %s", content[:200])
                     return {"status": "failed", "error": "PRD 响应格式无效"}
                 
-                data = json.loads(content)
+                data = _parse_json_safe(content)
+                if data is None:
+                    raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
                 return {"status": "completed", "data": data}
             except json.JSONDecodeError as exc:
-                logger.error("PRD JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                logger.error("PRD JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
                 return {"status": "failed", "error": f"PRD 格式错误: {str(exc)}"}
             except Exception as exc:
                 logger.error("PRD 设计失败: %s", exc)
@@ -335,10 +472,12 @@ class AgentService:
                     logger.error("成本估算响应中未找到 JSON 内容，原始输出: %s", content[:200])
                     return {"status": "failed", "error": "成本估算响应格式无效"}
                 
-                data = json.loads(content)
+                data = _parse_json_safe(content)
+                if data is None:
+                    raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
                 return {"status": "completed", "data": data}
             except json.JSONDecodeError as exc:
-                logger.error("成本估算 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                logger.error("成本估算 JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
                 return {"status": "failed", "error": f"成本估算格式错误: {str(exc)}"}
             except Exception as exc:
                 logger.error("成本估算失败: %s", exc)
@@ -402,14 +541,9 @@ class AgentService:
                     logger.error("开发响应中未找到 JSON 内容，原始输出: %s", content[:200])
                     return {"status": "failed", "error": "开发响应格式无效"}
                 
-                # 尝试修复常见的 JSON 格式问题
-                try:
-                    data = json.loads(content)
-                except json.JSONDecodeError:
-                    # 尝试修复：移除尾随逗号
-                    import re
-                    fixed_content = re.sub(r',\s*([}\]])', r'\1', content)
-                    data = json.loads(fixed_content)
+                data = _parse_json_safe(content)
+                if data is None:
+                    raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
 
                 # 将 LLM 生成的代码文件写入 data/users/{user_id}/{ticket_id}/成品/
                 files = data.get("files")
@@ -420,11 +554,11 @@ class AgentService:
                         if not isinstance(entry, dict):
                             continue
                         file_path = entry.get("path") or entry.get("file") or entry.get("name")
-                        file_path = file_path.lstrip("/\\")  # 防止绝对路径逃逸 output_root
                         file_content = entry.get("content") or entry.get("code") or ""
                         if not file_path or not file_content:
                             continue
-                        target = output_root / file_path
+                        safe_path = _clean_output_path(file_path, user_id, ticket_id)
+                        target = output_root / safe_path
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(file_content, encoding="utf-8")
                         saved_count += 1
@@ -435,7 +569,7 @@ class AgentService:
 
                 return {"status": "completed", "data": data}
             except json.JSONDecodeError as exc:
-                logger.error("开发 JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+                logger.error("开发 JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
                 return {"status": "failed", "error": f"开发格式错误: {str(exc)}"}
             except Exception as exc:
                 logger.error("开发失败: %s", exc)
@@ -473,10 +607,12 @@ class AgentService:
                 logger.error("LLM 响应中未找到 JSON 内容，原始输出: %s", content[:200])
                 return {"status": "failed", "error": "LLM 响应格式无效"}
             
-            result = json.loads(content)
+            result = _parse_json_safe(content)
+            if result is None:
+                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
             return {"status": "completed", "data": result}
         except json.JSONDecodeError as exc:
-            logger.error("LLM JSON 解析失败: %s\n原始内容: %s", exc, content[:500])
+            logger.error("LLM JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
             return {"status": "failed", "error": f"LLM 格式错误: {str(exc)}"}
         except Exception as exc:
             logger.error("LLM 调用失败: %s", exc)

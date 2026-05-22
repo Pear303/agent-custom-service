@@ -789,7 +789,8 @@ async function loadTickets() {
         <div class="progress-bar"><div class="progress-fill" style="width: ${Math.max(0, t.progress || 0)}%"></div></div>
         ${localTags}
         ${t.status === 'pending_development' ? '<div style="font-size: 12px; color: #92400e; margin-top: 4px;">⚠️ 需求分析完成，请查看详情并确认是否开始开发</div>' : ''}
-        ${t.error ? `<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">错误：${t.error}</div>` : ''}
+        ${t.status === 'failed' ? '<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">⚠️ 处理失败，点击查看详情可重新处理</div>' : ''}
+        ${t.error && t.status !== 'failed' ? `<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">错误：${t.error}</div>` : ''}
         ${t.development_error ? `<div style="font-size: 12px; color: #991b1b; margin-top: 4px;">开发错误：${t.development_error}</div>` : ''}
       </div>
     `}).join('');
@@ -826,16 +827,18 @@ async function showTicketDetail(ticketId) {
     }
     const ticket = await resp.json();
     
-    if (ticket.error && !ticket.analysis) {
-      showToast(ticket.error, 'error');
-      return;
-    }
-
     const container = document.getElementById('ticketDetail');
     
-    // 开发按钮：仅在 pending_development 或 development_failed 状态显示
-    const devButton = (ticket.status === 'pending_development' || ticket.status === 'development_failed') 
+    // 开发按钮：pending_development 显示"开始开发"，development_failed 显示"重新开发"
+    const devButton = ticket.status === 'pending_development'
       ? `<button class="btn-primary" onclick="startDevelopment('${ticket.ticket_id}')" style="margin-top: 16px; width: 100%;">🚀 开始开发</button>`
+      : ticket.status === 'development_failed'
+      ? `<button class="btn-primary" onclick="startDevelopment('${ticket.ticket_id}')" style="margin-top: 16px; width: 100%;">🔄 重新开发</button>`
+      : '';
+    
+    // 重新处理按钮：failed 状态显示"重新处理"（重置并重新走需求分析→PRD→报价流程）
+    const retryButton = ticket.status === 'failed'
+      ? `<button class="btn-primary" onclick="retryTicket('${ticket.ticket_id}')" style="margin-top: 16px; width: 100%;">🔄 重新处理</button>`
       : '';
     
     // 开发中提示
@@ -889,7 +892,7 @@ async function showTicketDetail(ticketId) {
         </div>
       ` : ''}
 
-      ${devButton}
+      ${devButton || retryButton}
       ${developingHint}
       ${devOutput}
       ${devError}
@@ -934,6 +937,27 @@ async function startDevelopment(ticketId) {
     }
   } catch (err) {
     console.error('启动开发失败:', err);
+    showToast('网络错误，请稍后重试', 'error');
+  }
+}
+
+async function retryTicket(ticketId) {
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/task/' + ticketId + '/retry', {
+      method: 'POST',
+    }, 30000);
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    if (data.status === 'queued') {
+      showToast('工单已重新提交，正在排队处理...', 'success');
+      showTicketDetail(ticketId);
+    } else {
+      showToast(data.error || '重试失败', 'error');
+    }
+  } catch (err) {
+    console.error('重试工单失败:', err);
     showToast('网络错误，请稍后重试', 'error');
   }
 }

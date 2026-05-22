@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from .agent_service import AgentService
+from .agent_service import AgentService, _clean_output_path
 from .config import settings
 from .database import Database, DB_PATH
 from .schemas import ChatRequest, ChatResponse, SessionResetResponse, ServiceStatus
@@ -223,6 +223,35 @@ async def _run_development(ticket_id: str, ticket: dict):
         await db.update_ticket_status(ticket_id, "development_failed", development_error=str(exc))
 
 
+@app.post("/task/{ticket_id}/retry")
+async def retry_ticket(ticket_id: str):
+    """重试失败的工单：重置为 queued 并重新加入任务队列"""
+    await ensure_db_initialized()
+    ticket = await db.get_ticket(ticket_id)
+    if not ticket:
+        return {"status": "error", "error": "工单不存在"}
+    if ticket["status"] not in ("failed", "completed"):
+        return {"status": "error", "error": f"当前状态 ({ticket['status']}) 不允许重试"}
+
+    try:
+        logging.info("重试工单: %s (原状态: %s)", ticket_id, ticket["status"])
+        await db.update_ticket_status(
+            ticket_id,
+            "queued",
+            error=None,
+            analysis=None,
+            prd=None,
+            quote=None,
+            development_error=None,
+            development_output=None,
+        )
+        await task_queue.submit(ticket_id)
+        return {"status": "queued", "message": "工单已重新提交，正在排队处理"}
+    except Exception as exc:
+        logging.error("重试工单失败: %s", exc, exc_info=True)
+        return {"status": "error", "error": str(exc)}
+
+
 @app.post("/task/{ticket_id}/restore-local")
 async def restore_local_files(ticket_id: str):
     await ensure_db_initialized()
@@ -283,11 +312,11 @@ async def restore_local_files(ticket_id: str):
                 if not isinstance(entry, dict):
                     continue
                 file_path = entry.get("path") or entry.get("file") or entry.get("name")
-                file_path = file_path.lstrip("/\\")
                 file_content = entry.get("content") or entry.get("code") or ""
                 if not file_path or not file_content:
                     continue
-                target = product_dir / file_path
+                safe_path = _clean_output_path(file_path, ticket["user_id"], ticket_id)
+                target = product_dir / safe_path
                 if not target.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(file_content, encoding="utf-8")

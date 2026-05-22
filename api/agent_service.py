@@ -420,6 +420,7 @@ class AgentService:
                         if not isinstance(entry, dict):
                             continue
                         file_path = entry.get("path") or entry.get("file") or entry.get("name")
+                        file_path = file_path.lstrip("/\\")  # 防止绝对路径逃逸 output_root
                         file_content = entry.get("content") or entry.get("code") or ""
                         if not file_path or not file_content:
                             continue

@@ -93,21 +93,22 @@ def _build_workspace(root: Path, user_id: str | None, ticket_id: str | None) -> 
 
 
 def _resolve(path: str) -> Path:
-    """解析路径，相对路径基于 _ctx_workspace（已是完整目标目录）拼接"""
+    """解析路径，所有路径均约束在 workspace 内，防止文件逃逸到根目录。"""
     p = Path(path).expanduser()
     workspace = _ctx_workspace.get()
 
-    if not p.is_absolute():
-        if workspace is None:
-            import logging as _logging
-            _logging.getLogger(__name__).critical(
-                "_resolve: _ctx_workspace is None — 文件将解析到 CWD！"
-                " path=%s, thread=%s, user_id=%s, ticket_id=%s",
-                str(p), __import__("threading").get_ident(),
-                _ctx_user_id.get(), _ctx_ticket_id.get(),
-            )
-        else:
-            p = workspace / p
+    if workspace is not None:
+        if p.is_absolute():
+            p = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(".")
+        return (workspace / p).resolve()
+
+    import logging as _logging
+    _logging.getLogger(__name__).critical(
+        "_resolve: _ctx_workspace is None — 文件将解析到 CWD！"
+        " path=%s, thread=%s, user_id=%s, ticket_id=%s",
+        str(p), __import__("threading").get_ident(),
+        _ctx_user_id.get(), _ctx_ticket_id.get(),
+    )
     return p.resolve()
 
 

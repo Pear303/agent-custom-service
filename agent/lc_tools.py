@@ -93,7 +93,15 @@ def _build_workspace(root: Path, user_id: str | None, ticket_id: str | None) -> 
 
 
 def _resolve(path: str) -> Path:
-    """解析路径，所有路径均约束在 workspace 内，防止文件逃逸到根目录。"""
+    """解析路径，所有路径均约束在 workspace 内，防止文件逃逸到根目录。
+    
+    LLM 可能传入各种格式的路径：
+    - 相对路径：src/app.js → workspace/src/app.js
+    - 绝对路径：f:/XiangMu/.../projects/myapp/app.js → 先剥离项目根，再拼到 workspace
+    - 带项目目录的路径：projects/myapp/app.js → 拼到 workspace/projects/myapp/app.js
+    
+    关键约束：最终路径必须严格在 workspace 目录内。
+    """
     p = Path(path).expanduser()
     workspace = _ctx_workspace.get()
 
@@ -104,7 +112,23 @@ def _resolve(path: str) -> Path:
                 p = p.relative_to(_project_root)
             except ValueError:
                 p = Path(p.name)
-        return (workspace / p).resolve()
+
+        resolved = (workspace / p).resolve()
+
+        # 安全检查：确保解析后的路径仍在 workspace 内
+        # 防止 LLM 通过 ../../ 等方式逃逸到 workspace 之外
+        try:
+            resolved.relative_to(workspace.resolve())
+        except ValueError:
+            # 路径逃逸，回退到只用文件名
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "路径逃逸检测: %s 解析到 workspace 外 (%s)，回退为文件名 %s",
+                path, resolved, p.name
+            )
+            resolved = workspace / p.name
+
+        return resolved
 
     import logging as _logging
     _logging.getLogger(__name__).critical(

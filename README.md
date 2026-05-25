@@ -1,23 +1,34 @@
 # OPC Smart Customer Service System
 
-基于 LangChain 的多轮对话 AI 服务系统。异步任务队列处理多会话并发、API 层与 Agent 核心分离解耦、内置 Web UI 支持流式对话展示。提供 CLI 与 REST API 双入口，可作为远程服务独立部署。
+基于 LangChain 的多轮对话 AI 服务系统。异步任务队列处理多会话并发、API 层与 Agent 核心分离解耦、前后端分离架构，前端采用 Vue 3 + TypeScript 支持流式对话展示。提供 CLI 与 REST API 双入口，可作为远程服务独立部署。
 
 ## 核心特性
 
 - **异步任务处理**：FastAPI + asyncio 实现非阻塞并发，支持多会话并行处理
 - **开发与业务分离**：API 层（`api/`）负责接口与路由，Agent 核心（`agent/`）专注智能决策
-- **前端交互界面**：内置 Web UI（`static/index.html`），支持实时流式对话展示
+- **前后端分离**：前端 Vue 3 项目（`frontend/`）独立构建部署，后端提供 REST API + SSE 流式
 
 ## 快速开始
 
 ```bash
-# 安装
+# 后端安装
 python -m venv .venv
 .venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 cp .env.example .env       # 填入 DEEPSEEK_API_KEY
 
+# 前端构建（生产模式必需）
+cd frontend
+npm install
+npm run build              # 产出 frontend/dist/
+cd ..
+
 # 启动服务 → http://localhost:8080
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
+
+# 前端开发模式（另开终端）
+cd frontend; npm run dev   # Vite → http://localhost:5173
+$env:DEV_MODE="true"       # 告知后端不挂载静态文件（已默认）
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
 
 # 或使用 CLI 交互模式
@@ -29,14 +40,27 @@ python agent.py
 ```
 agent.py                  CLI 入口
 api/                      FastAPI 服务层（开发与业务分离）
-├── main.py               API 路由与 SSE 流式输出
-├── agent_service.py      Agent 调用封装
-├── session_manager.py    会话管理
-├── task_queue.py         异步任务队列
-├── database.py           SQLite 数据库管理
-├── config.py             服务配置
-├── schemas.py            请求/响应模型
-└── tools/                API 层专用工具（helpdesk、通知、产品目录等）
+├── main.py               应用入口、SSE 流式输出、路由挂载
+├── core/                 核心基础设施（配置、数据库、生命周期）
+├── routers/              路由模块（health、chat、session、task）
+├── services/             业务逻辑层（Agent 服务、会话管理）
+├── clients/              外部服务客户端（Dify）
+├── task_queue.py          异步任务队列（Worker Pool）
+├── schemas/              请求/响应模型（Pydantic）
+└── utils/                工具函数（文件管理、进度计算）
+frontend/                 Vue 3 前端（前后端分离，独立构建）
+├── src/
+│   ├── main.ts           Vue 应用入口
+│   ├── App.vue           根组件（Header + Tabs + Router View）
+│   ├── api/              API 层（chat.ts SSE 流式引擎、task.ts 工单 CRUD）
+│   ├── stores/           Pinia 状态管理（user、chat、ticket、toast）
+│   ├── router/           Vue Router（/、/requirement、/ticket/:id）
+│   ├── views/            页面组件（ChatView、RequirementView、TicketDetailView）
+│   ├── components/       UI 组件（ChatMessage、ChatInput、TicketCard 等）
+│   ├── types/            TypeScript 类型定义
+│   └── assets/           CSS 设计系统（27 个 Design Token）
+├── vite.config.ts        Vite 构建配置（@ 别名、API 代理）
+└── package.json          依赖清单（Vue 3、Pinia、Vue Router、Axios）
 agent/                    Agent 核心逻辑
 ├── lc_agent.py           主 Agent 循环（LCAgent）
 ├── lc_tools.py           工具定义（@tool 函数）
@@ -53,8 +77,7 @@ agent/                    Agent 核心逻辑
     ├── registry.py       子代理注册表（工具白名单 + max_turns）
     └── spec.py           子代理规格定义
 
-static/                   前端资源
-└── index.html            Web UI 界面（实时对话展示）
+static/                   遗留静态资源（旧版单文件前端，保留兼容）
 templates/                身份/引导与提示词模板
 ├── SOUL.md               Agent 身份引导
 ├── SOUL_CS.md            客服身份引导

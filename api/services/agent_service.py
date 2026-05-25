@@ -6,19 +6,21 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import AsyncGenerator
 
 from openai import AsyncOpenAI
 
 from .session_manager import SessionManager, Session
-from services.dify import DifyChatflowClient
+from ..clients.dify import DifyChatflowClient
+from ..utils.file_manager import _clean_output_path
 from agent.factory import create_agent
 from agent.lc_tools import set_workspace, set_skills_loader, set_todo_store, set_subagent_deps, set_user_id, set_ticket_id, clear_context, _build_workspace
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).parent.parent
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 _AGENT_CONCURRENCY_LIMIT = 5
 _agent_semaphore = asyncio.Semaphore(_AGENT_CONCURRENCY_LIMIT)
@@ -105,7 +107,8 @@ def _try_truncated_json(content: str) -> dict:
     raise json.JSONDecodeError("No valid JSON found in truncated content", content, 0)
 
 
-def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, output_subdir=None):
+def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, output_subdir=None,
+                       skills_loader=None, todo_store=None, sub_reg=None):
     """在线程中设置上下文变量 (ContextVar) 后执行调用。
 
     asyncio.to_thread 不会自动复制上下文变量，因此必须在新线程中显式设置。
@@ -121,6 +124,16 @@ def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, outpu
     set_workspace(effective_ws)
     set_user_id(user_id)
     set_ticket_id(ticket_id)
+    if skills_loader is not None:
+        set_skills_loader(skills_loader)
+    if todo_store is not None:
+        set_todo_store(todo_store)
+    if sub_reg is not None:
+        # sub_reg 是一个元组 (llm, registry) 或 registry 对象
+        if isinstance(sub_reg, tuple) and len(sub_reg) == 2:
+            set_subagent_deps(sub_reg[0], sub_reg[1])
+        else:
+            set_subagent_deps(None, sub_reg)
     try:
         return _invoke_with_retry(executor, input_data)
     finally:
@@ -152,58 +165,6 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
                 logger.warning("第 %d 次尝试失败，%0.1f 秒后重试: %s", attempt + 1, _RETRY_DELAY, exc)
                 time.sleep(_RETRY_DELAY)
     raise last_exc
-
-def _clean_output_path(file_path: str, user_id: str, ticket_id: str) -> Path:
-    """清理文件路径，反复剥离所有可能的嵌套前缀，防止路径二次拼接。
-
-    LLM 返回的 file_path 可能携带各种前缀：
-    - 完整的绝对路径（F:\\...\\data\\users\\...\\成品\\...）
-    - data/users/{uid}/{tid}/成品/ 前缀（已在 output_root 中）
-    - _build/ 前缀（临时 workspace）
-    - output/ 前缀
-    - data/ 前缀
-
-    此函数反复剥离这些前缀直到路径不再变化，确保最终路径是纯粹的相对路径。
-    """
-    p = Path(file_path)
-
-    # 如果是绝对路径，先相对于项目根目录消去
-    if p.is_absolute():
-        try:
-            p = p.relative_to(_PROJECT_ROOT)
-        except ValueError:
-            p = Path(p.name)
-
-    # 可能反复出现的嵌套前缀，按从具体到笼统排列
-    nesting_prefixes = [
-        Path("data") / "users" / user_id / ticket_id / "成品",
-        Path("data") / "users" / user_id / ticket_id / "_build",
-        Path("data") / "users" / user_id / ticket_id,
-        Path("data") / "users" / user_id,
-        Path("data") / "users",
-        Path("data"),
-        Path("output"),
-        Path("_build"),
-    ]
-
-    # 反复剥离直到路径不再变化（处理多重嵌套）
-    changed = True
-    while changed and len(p.parts) > 1:
-        changed = False
-        for prefix in nesting_prefixes:
-            try:
-                stripped = p.relative_to(prefix)
-                if stripped != p:
-                    p = stripped
-                    changed = True
-                    break
-            except ValueError:
-                continue
-
-    # 去除首尾的路径分隔符
-    clean = str(p).lstrip("/\\").rstrip("/\\")
-    return Path(clean) if clean else p
-
 
 REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
 
@@ -279,20 +240,28 @@ class AgentService:
                 conversation_id=session.conversation_id,
             )
             session.conversation_id = resp.get("conversation_id")
-            await self.session_manager._save_session(session)
-            return {
-                "user_id": user_id,
-                "answer": resp.get("answer", ""),
-                "conversation_id": resp.get("conversation_id"),
-                "source": "dify",
-            }
+            answer = resp.get("answer", "")
+            source = "dify"
         except Exception as exc:
             logger.warning("Dify 调用失败，使用兜底 Agent: %s", exc)
-            return await self._fallback(user_id, message)
+            fallback = await self._fallback(user_id, message)
+            answer = fallback["answer"]
+            source = fallback["source"]
+
+        session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
+        session.history.append({"role": "assistant", "content": answer, "source": source, "timestamp": int(time.time())})
+        await self.session_manager._save_session(session)
+        return {
+            "user_id": user_id,
+            "answer": answer,
+            "conversation_id": session.conversation_id,
+            "source": source,
+        }
 
     async def chat_stream(self, user_id: str, message: str) -> AsyncGenerator[str, None]:
         session = await self.session_manager.get_or_create_async(user_id)
         dify = await self._get_dify()
+        full_answer = ""
 
         try:
             async for chunk in dify.chat_stream(
@@ -302,13 +271,17 @@ class AgentService:
             ):
                 event = chunk.get("event")
                 if event == "message":
+                    chunk_text = chunk.get("answer", "")
+                    full_answer += chunk_text
                     yield json.dumps({
                         "event": "message",
-                        "answer": chunk.get("answer", ""),
+                        "answer": chunk_text,
                         "source": "dify",
                     }) + "\n"
                 elif event == "message_end":
                     session.conversation_id = chunk.get("conversation_id")
+                    session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
+                    session.history.append({"role": "assistant", "content": full_answer, "source": "dify", "timestamp": int(time.time())})
                     await self.session_manager._save_session(session)
                     yield json.dumps({
                         "event": "message_end",
@@ -320,23 +293,21 @@ class AgentService:
         except Exception as exc:
             logger.warning("Dify 流式调用失败，使用兜底 Agent: %s", exc)
             fallback_answer = await self._fallback(user_id, message)
+            full_answer = fallback_answer["answer"]
             yield json.dumps({
                 "event": "message",
-                "answer": fallback_answer["answer"],
+                "answer": full_answer,
                 "source": "agent",
             }) + "\n"
+            session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
+            session.history.append({"role": "assistant", "content": full_answer, "source": "agent", "timestamp": int(time.time())})
+            await self.session_manager._save_session(session)
             yield json.dumps({"event": "message_end"}) + "\n"
 
     async def analyze_requirement(self, user_id: str, requirement: dict, ticket_id: str | None = None) -> dict:
         """需求分析：将客户需求转化为结构化需求简报"""
         async with _agent_semaphore:
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
-            set_workspace(agent.root)
-            set_user_id(user_id)
-            set_ticket_id(ticket_id)
-            set_skills_loader(agent.skills)
-            set_todo_store(agent.todo_store)
-            set_subagent_deps(agent.llm, agent.sub_reg)
 
             prompt = f"""基于以下客户需求，按要求输出 JSON 格式的需求分析结果：
 
@@ -353,6 +324,9 @@ class AgentService:
                     agent.root, user_id, ticket_id,
                     agent.executor,
                     {"input": prompt, "chat_history": []},
+                    skills_loader=agent.skills,
+                    todo_store=agent.todo_store,
+                    sub_reg=(agent.llm, agent.sub_reg),
                 )
                 content = result["output"]
                 if "</think>" in content:
@@ -383,12 +357,6 @@ class AgentService:
     async def design_prd(self, user_id: str, analysis: dict, ticket_id: str | None = None) -> dict:
         async with _agent_semaphore:
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
-            set_workspace(agent.root)
-            set_user_id(user_id)
-            set_ticket_id(ticket_id)
-            set_skills_loader(agent.skills)
-            set_todo_store(agent.todo_store)
-            set_subagent_deps(agent.llm, agent.sub_reg)
 
             prompt = f"""基于以下需求分析结果，按要求输出 JSON 格式的 PRD：
 
@@ -405,6 +373,9 @@ class AgentService:
                     agent.root, user_id, ticket_id,
                     agent.executor,
                     {"input": prompt, "chat_history": []},
+                    skills_loader=agent.skills,
+                    todo_store=agent.todo_store,
+                    sub_reg=(agent.llm, agent.sub_reg),
                 )
                 content = result["output"]
                 if "</think>" in content:
@@ -435,12 +406,6 @@ class AgentService:
     async def estimate_cost(self, user_id: str, prd: dict, analysis: dict, ticket_id: str | None = None) -> dict:
         async with _agent_semaphore:
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
-            set_workspace(agent.root)
-            set_user_id(user_id)
-            set_ticket_id(ticket_id)
-            set_skills_loader(agent.skills)
-            set_todo_store(agent.todo_store)
-            set_subagent_deps(agent.llm, agent.sub_reg)
 
             combined = {**prd, **analysis}
             prompt = f"""基于以下 PRD 和需求分析，按要求输出 JSON 格式的成本估算：
@@ -458,6 +423,9 @@ class AgentService:
                     agent.root, user_id, ticket_id,
                     agent.executor,
                     {"input": prompt, "chat_history": []},
+                    skills_loader=agent.skills,
+                    todo_store=agent.todo_store,
+                    sub_reg=(agent.llm, agent.sub_reg),
                 )
                 content = result["output"]
                 if "</think>" in content:
@@ -502,13 +470,7 @@ class AgentService:
 
     async def develop_project(self, user_id: str, project_data: dict, ticket_id: str | None = None) -> dict:
         async with _agent_semaphore:
-            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
-            set_workspace(agent.root)
-            set_user_id(user_id)
-            set_ticket_id(ticket_id)
-            set_skills_loader(agent.skills)
-            set_todo_store(agent.todo_store)
-            set_subagent_deps(agent.llm, agent.sub_reg)
+            agent = create_agent(user_id=user_id, ticket_id=ticket_id, max_iterations=80)
 
             prompt = f"""基于以下项目数据，按要求输出 JSON 格式的开发结果：
 
@@ -527,8 +489,16 @@ class AgentService:
                     agent.executor,
                     {"input": prompt, "chat_history": []},
                     "成品",
+                    skills_loader=agent.skills,
+                    todo_store=agent.todo_store,
+                    sub_reg=(agent.llm, agent.sub_reg),
                 )
                 content = result["output"]
+
+                # 检测 Agent 迭代耗尽
+                if "max iterations" in content.lower() or "Agent stopped" in content:
+                    logger.error("Agent 迭代次数耗尽，原始输出: %s", content[:200])
+                    return {"status": "failed", "error": "Agent 迭代次数耗尽，项目过于复杂未能完成。可重试或简化需求。"}
                 if "</think>" in content:
                     content = content.split("</think>", 1)[1].strip()
                 
@@ -566,6 +536,16 @@ class AgentService:
                         logger.info("开发成品已保存 %d 个文件到 %s", saved_count, output_root)
                         data["_output_dir"] = str(output_root)
                         data["_file_count"] = saved_count
+
+                # 开发完成后清理 _build 临时目录
+                _build_dir = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "_build"
+                if ticket_id and _build_dir.exists():
+                    import shutil
+                    try:
+                        shutil.rmtree(_build_dir)
+                        logger.info("已清理 _build 临时目录: %s", _build_dir)
+                    except Exception as e:
+                        logger.warning("清理 _build 目录失败: %s", e)
 
                 return {"status": "completed", "data": data}
             except json.JSONDecodeError as exc:

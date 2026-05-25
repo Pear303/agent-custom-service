@@ -2,28 +2,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .utils.file_manager import _save_report
+
 if TYPE_CHECKING:
-    from api.database import Database
-    from api.agent_service import AgentService
+    from .core.database import Database
+    from .services.agent_service import AgentService
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).parent.parent
-
-
-def _save_report(user_id: str, ticket_id: str, filename: str, data: dict) -> Path:
-    """将报告保存到 data/users/{user_id}/{ticket_id}/报告/{filename}"""
-    report_dir = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "报告"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    filepath = report_dir / filename
-    filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("报告已保存: %s", filepath)
-    return filepath
 
 
 class TaskQueue:

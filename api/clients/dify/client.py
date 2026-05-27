@@ -107,12 +107,8 @@ class DifyChatflowClient:
         base = self.config.base_url.rstrip("/")
         return f"{base}{path}"
 
-    @staticmethod
-    def _headers() -> dict[str, str]:
-        from .config import DifyConfig
-
-        cfg = DifyConfig.from_env()
+    def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {cfg.api_key}",
+            "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }

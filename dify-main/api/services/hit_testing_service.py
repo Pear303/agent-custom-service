@@ -56,14 +56,27 @@ class HitTestingService:
 
     @classmethod
     def _dump_retrieval_records(cls, records: list[Any]) -> list[dict[str, Any]]:
+        # Collect document_ids from both the serialized dict and the original ORM objects,
+        # since model_dump() on SQLAlchemy dataclass may not always include document_id.
         dumped_records = [record.model_dump() for record in records]
-        document_ids = {
-            segment.get("document_id")
-            for record in dumped_records
-            if isinstance(record, dict)
-            for segment in [record.get("segment")]
-            if isinstance(segment, dict) and segment.get("document_id")
-        }
+
+        # Build a mapping from record index → document_id, trying dict first, then ORM object
+        record_doc_ids: dict[int, str | None] = {}
+        for i, record in enumerate(records):
+            dumped = dumped_records[i]
+            segment = dumped.get("segment") if isinstance(dumped, dict) else None
+            doc_id: str | None = None
+            if isinstance(segment, dict):
+                doc_id = segment.get("document_id")
+            # Fallback: get document_id directly from the ORM segment object
+            if not doc_id and hasattr(record, "segment") and hasattr(record.segment, "document_id"):
+                doc_id = str(record.segment.document_id)
+                # Also inject document_id into the dumped segment dict so downstream code can use it
+                if isinstance(segment, dict) and "document_id" not in segment:
+                    segment["document_id"] = doc_id
+            record_doc_ids[i] = doc_id
+
+        document_ids = {doc_id for doc_id in record_doc_ids.values() if doc_id}
         if not document_ids:
             return dumped_records
 
@@ -76,22 +89,28 @@ class HitTestingService:
 
         records_with_documents: list[dict[str, Any]] = []
         missing_document_ids: set[str] = set()
-        for record in dumped_records:
-            segment = record.get("segment")
+        for i, dumped in enumerate(dumped_records):
+            segment = dumped.get("segment") if isinstance(dumped, dict) else None
             if not isinstance(segment, dict):
-                records_with_documents.append(record)
+                records_with_documents.append(dumped)
                 continue
 
-            document_id = segment.get("document_id")
-            if document_id in documents:
+            document_id = record_doc_ids.get(i)
+            if document_id and document_id in documents:
                 segment["document"] = documents[document_id]
-                records_with_documents.append(record)
+                records_with_documents.append(dumped)
             elif document_id:
+                # Document not found in DB — still include the record but with document=null,
+                # so the frontend doesn't crash from an all-null expanded dict from marshal.
+                segment["document"] = None
+                records_with_documents.append(dumped)
                 missing_document_ids.add(document_id)
+            else:
+                records_with_documents.append(dumped)
 
         if missing_document_ids:
             logger.warning(
-                "Skipping hit-testing records with missing documents, document_ids=%s",
+                "Hit-testing records have missing documents (showing null), document_ids=%s",
                 sorted(missing_document_ids),
             )
 

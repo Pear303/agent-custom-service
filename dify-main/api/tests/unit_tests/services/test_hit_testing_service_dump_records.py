@@ -68,7 +68,7 @@ class TestHitTestingServiceDumpRecords:
             "doc_metadata": None,
         }
 
-    def test_dump_retrieval_records_skips_records_with_missing_documents(self, caplog):
+    def test_dump_retrieval_records_keeps_records_with_missing_documents(self, caplog):
         record = _retrieval_record(
             {
                 "segment": {
@@ -84,5 +84,7 @@ class TestHitTestingServiceDumpRecords:
         with patch("services.hit_testing_service.db.session.scalars", return_value=scalars_result):
             result = HitTestingService._dump_retrieval_records([record])
 
-        assert result == []
-        assert "Skipping hit-testing records with missing documents" in caplog.text
+        # Missing documents no longer skip the record; document is set to None
+        assert len(result) == 1
+        assert result[0]["segment"]["document"] is None
+        assert "missing documents" in caplog.text

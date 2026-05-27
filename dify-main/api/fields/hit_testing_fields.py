@@ -33,7 +33,7 @@ segment_fields = {
     "completed_at": TimestampField,
     "error": fields.String,
     "stopped_at": TimestampField,
-    "document": fields.Nested(document_fields),
+    "document": fields.Nested(document_fields, allow_null=True),
 }
 
 child_chunk_fields = {

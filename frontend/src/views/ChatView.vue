@@ -1,6 +1,6 @@
 <template>
   <div class="panel active chat-layout">
-    <!-- 聊天对话框 --><
+    <!-- 聊天对话框 -->
     <div class="chat-container">
       <div class="chat-header">
         <span class="chat-header-title">AI 智能客服</span>

@@ -30,8 +30,14 @@ def create_router(session_manager, dify_client_factory) -> APIRouter:
         }
 
         try:
+            import httpx
             dify = dify_client_factory()
-            await dify.chat(query="health_check", user_id="health_check", conversation_id="")
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, trust_env=False) as http:
+                resp = await http.get(
+                    dify._build_url("/v1/parameters"),
+                    headers=dify._headers(),
+                )
+                resp.raise_for_status()
             health_status["checks"]["dify"] = "connected"
         except Exception as e:
             health_status["checks"]["dify"] = f"error: {str(e)[:100]}"

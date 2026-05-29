@@ -32,10 +32,29 @@ class DifyChatflowClient:
         conversation_id: Optional[str] = None,
         timeout: float = 60.0,
     ) -> dict:
+        merged_inputs = dict(inputs or {})
+        merged_inputs.setdefault("user_id", user_id)
         payload = {
-            "inputs": inputs or {},
+            "inputs": merged_inputs,
             "query": query,
             "response_mode": "blocking",
+            "user": user_id,
+        }
+
+    async def chat_stream(
+        self,
+        query: str,
+        user_id: str,
+        inputs: Optional[dict] = None,
+        conversation_id: Optional[str] = None,
+        timeout: float = 120.0,
+    ) -> AsyncGenerator[dict, None]:
+        merged_inputs = dict(inputs or {})
+        merged_inputs.setdefault("user_id", user_id)
+        payload = {
+            "inputs": merged_inputs,
+            "query": query,
+            "response_mode": "streaming",
             "user": user_id,
         }
         if conversation_id or self._sessions.get(user_id):
@@ -63,8 +82,11 @@ class DifyChatflowClient:
         conversation_id: Optional[str] = None,
         timeout: float = 120.0,
     ) -> AsyncGenerator[dict, None]:
+        # 自动注入 user_id 到 inputs，Dify 工作流可通过 {{user_id}} 引用
+        merged_inputs = dict(inputs or {})
+        merged_inputs.setdefault("user_id", user_id)
         payload = {
-            "inputs": inputs or {},
+            "inputs": merged_inputs,
             "query": query,
             "response_mode": "streaming",
             "user": user_id,

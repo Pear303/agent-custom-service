@@ -53,11 +53,13 @@ from .routers.health import create_router as create_health_router
 from .routers.chat import create_router as create_chat_router
 from .routers.session import create_router as create_session_router
 from .routers.task import create_router as create_task_router
+from .routers.dify_tools import create_router as create_dify_tools_router
 
 app.include_router(create_health_router(session_manager, lambda: DifyChatflowClient()))
 app.include_router(create_chat_router(agent_service))
 app.include_router(create_session_router(session_manager))
 app.include_router(create_task_router(db, agent_service, task_queue))
+app.include_router(create_dify_tools_router(db, agent_service, task_queue))
 
 # 生产模式：挂载前端构建产物 + SPA 回退
 # 注意：必须放在所有 API 路由之后，否则会拦截 API 请求

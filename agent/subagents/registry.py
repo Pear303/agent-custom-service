@@ -239,7 +239,6 @@ class SubagentRegistry:
 
             # 创建并存储子代理规格
             self._specs[agent_name] = SubagentSpec(
-                name=agent_name,
                 description=cfg["description"],
                 system_prompt=system_prompt,
                 tool_names=tuple(cfg["tool_names"]),

@@ -93,7 +93,7 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         }
 
     @router.get("/task/list")
-    async def list_tickets(user_id: str, limit: int = 50):
+    async def list_tickets(user_id: str, limit: int = 5):
         tickets = await db.get_user_tickets(user_id, limit)
         for ticket in tickets:
             ticket["local_status"] = _enrich_local_status(
@@ -102,6 +102,26 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             )
             ticket["progress"] = _calculate_progress(ticket["status"])
         return {"tickets": tickets}
+    
+    @router.get("/task/list/description")
+    async def get_tickets_description(user_id: str, limit: int = 5):
+        tickets = await db.get_user_tickets(user_id, limit)
+        tickets_description = []
+        for ticket in tickets:
+            ticket["local_status"] = _enrich_local_status(
+                ticket,
+                _check_local_status(user_id, ticket["ticket_id"], _PROJECT_ROOT),
+            )
+            ticket["progress"] = _calculate_progress(ticket["status"])
+            tickets_description.append({
+                "ticket_id": ticket["ticket_id"],
+                "user_id": ticket["user_id"],
+                "project_name": ticket.get("project_name", "/"),
+                "project_type": ticket.get("project_type", "/"),
+                 "status": ticket["status"],
+                 "development_status": ticket.get("development_status", "/"),
+            })
+        return {"tickets_description": tickets_description}
 
     @router.post("/task/{ticket_id}/start-development")
     async def start_development(ticket_id: str):

@@ -39,6 +39,18 @@ _JSONL_ROLE_TO_MESSAGE_CLS: dict[str, type[BaseMessage]] = {
     "tool": ToolMessage,
 }
 
+"""
+# 额外扩展的功能
+    def append_history()           # 追加单条记录
+    def today_episode_path()       # 今日情景记忆路径
+    def read_today_episode()       # 读取情景记忆
+    def append_episode()           # 追加情景记忆
+    def read_memory()              # 读取长期记忆
+    def write_memory()             # 写入长期记忆
+    def append_compact_marker()    # 添加压缩标记
+"""
+
+
 
 class MemoryStore(BaseChatMessageHistory):
     """三层记忆存储管理器。

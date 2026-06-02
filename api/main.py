@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
 from .core.database import Database
 from .core.lifespan import create_lifespan
+from .core.rate_limit import RateLimitMiddleware
 from .services.session_manager import SessionManager
 from .services.agent_service import AgentService
 from .task_queue import TaskQueue
@@ -31,12 +32,13 @@ session_manager = SessionManager(
 )
 agent_service = AgentService(session_manager)
 task_queue = TaskQueue(db, agent_service)
+dify_client = DifyChatflowClient()
 
 # ── FastAPI 应用创建 ────────────────────────────────────────
 app = FastAPI(
     title="Agent Customer Service API",
     version="0.5.0",
-    lifespan=create_lifespan(db, session_manager, task_queue),
+    lifespan=create_lifespan(db, session_manager, task_queue, dify_client),
 )
 
 # 中间件
@@ -47,6 +49,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RateLimitMiddleware, requests_per_minute=60, burst=10)
 
 # ── 路由挂载 ────────────────────────────────────────────────
 from .routers.health import create_router as create_health_router
@@ -55,7 +58,7 @@ from .routers.session import create_router as create_session_router
 from .routers.task import create_router as create_task_router
 from .routers.dify_tools import create_router as create_dify_tools_router
 
-app.include_router(create_health_router(session_manager, lambda: DifyChatflowClient()))
+app.include_router(create_health_router(session_manager, dify_client))
 app.include_router(create_chat_router(agent_service))
 app.include_router(create_session_router(session_manager))
 app.include_router(create_task_router(db, agent_service, task_queue))

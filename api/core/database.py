@@ -1,6 +1,7 @@
 """SQLite 数据库层：工单持久化与异步查询"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -43,8 +44,16 @@ class Database:
         if self._pool:
             await self._pool.close()
 
+    CURRENT_SCHEMA_VERSION = 2
+
     async def _create_tables(self):
         """创建工单表和会话表及索引"""
+        await self._pool.execute("""
+            CREATE TABLE IF NOT EXISTS _meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         await self._pool.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
                 ticket_id TEXT PRIMARY KEY,
@@ -81,21 +90,36 @@ class Database:
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_tickets_created ON tickets(created_at DESC)")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(last_active DESC)")
-        
-        # 迁移：为已存在的表添加新字段（如果不存在）
-        cursor = await self._pool.execute("PRAGMA table_info(tickets)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if 'development_status' not in columns:
-            await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_status TEXT DEFAULT 'not_started'")
-        if 'development_output' not in columns:
-            await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_output JSON")
-        if 'development_error' not in columns:
-            await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_error TEXT")
 
-        # 迁移：将 session history 中 "role": "bot" 统一为 "role": "assistant"
-        await self._migrate_bot_to_assistant()
+        stored_version = await self._get_schema_version()
+        if stored_version < 1:
+            cursor = await self._pool.execute("PRAGMA table_info(tickets)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'development_status' not in columns:
+                await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_status TEXT DEFAULT 'not_started'")
+            if 'development_output' not in columns:
+                await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_output JSON")
+            if 'development_error' not in columns:
+                await self._pool.execute("ALTER TABLE tickets ADD COLUMN development_error TEXT")
 
+        if stored_version < 2:
+            await self._migrate_bot_to_assistant()
+
+        await self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
         await self._pool.commit()
+
+    async def _get_schema_version(self) -> int:
+        cursor = await self._pool.execute(
+            "SELECT value FROM _meta WHERE key = 'schema_version'"
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def _set_schema_version(self, version: int):
+        await self._pool.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
+            (str(version),),
+        )
 
     """
     tickets:
@@ -155,7 +179,8 @@ class Database:
                 "status": "queued",
             }
             ticket_file = ticket_dir / "工单.json"
-            ticket_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            content = json.dumps(record, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(ticket_file.write_text, content, "utf-8")
             logger.info("工单文件已保存: %s", ticket_file)
         except Exception as e:
             logger.warning("保存工单文件失败: %s", e)
@@ -184,14 +209,23 @@ class Database:
             return self._row_to_dict(cursor, row)
         return None
 
-    async def get_user_tickets(self, user_id: str, limit: int = 50) -> list[dict]:
+    async def get_user_tickets(self, user_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
         """查询用户的工单列表"""
         cursor = await self._pool.execute(
-            "SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
+            "SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         )
         rows = await cursor.fetchall()
         return [self._row_to_dict(cursor, row) for row in rows]
+
+    async def count_user_tickets(self, user_id: str) -> int:
+        """查询用户工单总数"""
+        cursor = await self._pool.execute(
+            "SELECT COUNT(*) FROM tickets WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
 
     async def get_queued_tickets(self, limit: int = 10) -> list[dict]:
         """获取待处理的工单（用于重启后恢复队列）"""
@@ -321,6 +355,17 @@ class Database:
                     (json.dumps(history, ensure_ascii=False), user_id),
                 )
                 logger.info("迁移 session %s: bot → assistant", user_id)
+
+    async def get_stats(self) -> dict:
+        """获取数据库统计信息（供健康检查使用）"""
+        cursor1 = await self._pool.execute("SELECT COUNT(*) FROM tickets")
+        ticket_count = (await cursor1.fetchone())[0]
+        cursor2 = await self._pool.execute("SELECT COUNT(*) FROM sessions")
+        session_count = (await cursor2.fetchone())[0]
+        return {
+            "tickets": ticket_count,
+            "sessions": session_count,
+        }
 
     @staticmethod
     def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:

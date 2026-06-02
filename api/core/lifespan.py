@@ -9,13 +9,19 @@ from fastapi import FastAPI
 from .database import Database
 from ..services.session_manager import SessionManager
 from ..task_queue import TaskQueue
+from ..clients.dify import DifyChatflowClient
 
 logger = logging.getLogger(__name__)
 
 
-def create_lifespan(db: Database, session_manager: SessionManager, task_queue: TaskQueue):
+def create_lifespan(
+    db: Database,
+    session_manager: SessionManager,
+    task_queue: TaskQueue,
+    dify_client: DifyChatflowClient | None = None,
+):
     """创建 FastAPI lifespan 上下文管理器。
-    
+
     每个组件通过参数注入，避免模块级全局变量。
     """
 
@@ -37,6 +43,8 @@ def create_lifespan(db: Database, session_manager: SessionManager, task_queue: T
         expired = await session_manager.cleanup_expired()
         if expired:
             logger.info("清理了 %d 个过期会话", expired)
+        if dify_client:
+            await dify_client.close()
         await db.close()
 
     return lifespan

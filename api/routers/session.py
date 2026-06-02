@@ -16,7 +16,7 @@ def create_router(session_manager) -> APIRouter:
     
     @router.get("/session/history", response_model=SessionHistoryResponse)
     async def get_session_history(user_id: str):
-        session = session_manager.get_or_create(user_id)  # 用同步版，只是读取
+        session = await session_manager.get_or_create(user_id)
         return SessionHistoryResponse(
             user_id=user_id,
             history=session.history,

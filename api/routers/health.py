@@ -14,7 +14,7 @@ from ..schemas.common import ServiceStatus
 logger = logging.getLogger(__name__)
 
 
-def create_router(session_manager, dify_client_factory) -> APIRouter:
+def create_router(session_manager, dify_client) -> APIRouter:
     router = APIRouter(tags=["health"])
 
     @router.get("/status", response_model=ServiceStatus)
@@ -30,14 +30,12 @@ def create_router(session_manager, dify_client_factory) -> APIRouter:
         }
 
         try:
-            import httpx
-            dify = dify_client_factory()
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, trust_env=False) as http:
-                resp = await http.get(
-                    dify._build_url("/v1/parameters"),
-                    headers=dify._headers(),
-                )
-                resp.raise_for_status()
+            http_client = await dify_client._get_http_client(timeout=10.0)
+            resp = await http_client.get(
+                dify_client._build_url("/v1/parameters"),
+                headers=dify_client._headers(),
+            )
+            resp.raise_for_status()
             health_status["checks"]["dify"] = "connected"
         except Exception as e:
             health_status["checks"]["dify"] = f"error: {str(e)[:100]}"
@@ -74,11 +72,9 @@ def create_router(session_manager, dify_client_factory) -> APIRouter:
             health_status["checks"]["disk"] = f"error: {str(e)[:100]}"
 
         try:
-            ticket_count = await session_manager.db._pool.execute("SELECT COUNT(*) FROM tickets")
-            session_count = await session_manager.db._pool.execute("SELECT COUNT(*) FROM sessions")
+            db_stats = await session_manager.db.get_stats()
             health_status["checks"]["database"] = {
-                "tickets": (await ticket_count.fetchone())[0],
-                "sessions": (await session_count.fetchone())[0],
+                **db_stats,
                 "status": "healthy",
             }
         except Exception as e:

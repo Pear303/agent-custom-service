@@ -36,11 +36,96 @@ _DEV_STATUS_LABELS = {
     "failed": "失败",
 }
 
+_TYPE_LABELS = {
+    "web": "网站开发",
+    "miniapp": "小程序",
+    "app": "移动 App",
+    "automation": "自动化脚本",
+    "data": "数据分析",
+    "ai": "AI 应用",
+    "other": "其他",
+}
+
 
 def create_router(db, agent_service, task_queue) -> APIRouter:
     router = APIRouter(prefix="/dify", tags=["dify-tools"])
 
     _PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+    @router.get("/ticket/list")
+    async def get_tickets_description(
+        user_id: str,
+        limit: int = Query(default=3, ge=1, le=10),
+        offset: int = Query(default=0, ge=0),
+    ):
+        """获取用户工单列表，返回固定格式的中文描述（面向 AI 可读）。"""
+        tickets = await db.get_user_tickets(user_id, limit, offset)
+        total = await db.count_user_tickets(user_id)
+
+        if not tickets:
+            msg = "暂无工单数据" if total == 0 else f"用户 {user_id} 共有 {total} 个工单，当前显示 0 个。"
+            return {
+                "success": True,
+                "data": [],
+                "total": total,
+                "summary": msg,
+            }
+
+        lines = []
+        formatted_tickets = []
+        for ticket in tickets:
+            ticket_id = ticket["ticket_id"]
+            user_id_val = ticket["user_id"]
+            project_name = ticket.get("project_name", "未命名项目")
+            project_type = _TYPE_LABELS.get(ticket.get("project_type", ""), "未指定")
+            status_label = _STATUS_LABELS.get(ticket["status"], ticket["status"])
+            dev_status = ticket.get("development_status", "not_started")
+            dev_status_label = _DEV_STATUS_LABELS.get(dev_status, dev_status)
+            progress = _calculate_progress(ticket["status"])
+
+            lines.append(
+                f"工单：{ticket_id}\n"
+                f"用户：{user_id_val}\n"
+                f"工单名称：{project_name}\n"
+                f"类型：{project_type}\n"
+                f"工单主状态：{status_label}\n"
+                f"开发状态：{dev_status_label}\n"
+                f"进度：{progress}%"
+            )
+            
+            formatted_tickets.append({
+                "ticket_id": ticket_id,
+                "user_id": user_id_val,
+                "status": status_label,
+                "title": project_name,
+                "created_at": ticket.get("created_at", ""),
+                "updated_at": ticket.get("updated_at", ""),
+            })
+
+        displayed = len(tickets)
+        count_line = f"用户 {user_id} 共有 {total} 个工单，当前显示 {displayed} 个。"
+
+        return {
+            "success": True,
+            "total": total,
+            "displayed": displayed,
+            "tickets": formatted_tickets,
+            "formatted": "\n\n".join(lines) + "\n\n" + count_line,
+            "summary": count_line,
+        }
+
+    @router.get("/ticket/count")
+    async def get_ticket_count(user_id: str):
+        """获取用户工单总数（面向 AI 可读）。"""
+        total = await db.count_user_tickets(user_id)
+        return {
+            "success": True,
+            "data": {
+                "user_id": user_id,
+                "total": total,
+            },
+            "summary": f"用户 {user_id} 共有 {total} 个工单。",
+        }
 
     @router.get("/ticket/detail")
     async def get_ticket_detail(ticket_id: str):

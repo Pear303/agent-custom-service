@@ -1,4 +1,4 @@
-"""Agent 服务：Dify 路由 + 兜底 Agent 逻辑 + 需求分析"""
+"""Agent 服务：Dify 路由 + 需求分析"""
 from __future__ import annotations
 
 import asyncio
@@ -10,10 +10,9 @@ import time
 from pathlib import Path
 from typing import AsyncGenerator
 
-from openai import AsyncOpenAI
-
 from .session_manager import SessionManager, Session
 from ..clients.dify import DifyChatflowClient
+from ..core.config import settings
 from ..utils.file_manager import _clean_output_path
 from agent.factory import create_agent
 from agent.lc_tools import set_workspace, set_skills_loader, set_todo_store, set_subagent_deps, set_user_id, set_ticket_id, clear_context, _build_workspace
@@ -22,11 +21,10 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
-_AGENT_CONCURRENCY_LIMIT = 5
-_agent_semaphore = asyncio.Semaphore(_AGENT_CONCURRENCY_LIMIT)
+_agent_semaphore = asyncio.Semaphore(settings.agent_concurrency_limit)
 
-_MAX_RETRIES = 2
-_RETRY_DELAY = 1.0
+_MAX_RETRIES = settings.agent_max_retries
+_BASE_DELAY = settings.agent_base_delay
 
 
 def _parse_json_safe(content: str, _debug_label: str = "") -> dict | None:
@@ -141,7 +139,12 @@ def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, outpu
 
 
 def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
-    """带有重试机制的同步执行器调用。
+    """带有指数退避重试机制的同步执行器调用。
+
+    退避公式：delay = base_delay * (2 ^ attempt) + jitter
+    - attempt=0: ~1s
+    - attempt=1: ~2s
+    - attempt=2: ~4s
 
     Args:
         executor: AgentExecutor 实例
@@ -154,6 +157,7 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
     Raises:
         若所有重试均失败，则抛出最后一次捕获的异常
     """
+    import random
     import time
     last_exc = None
     for attempt in range(max_retries + 1):
@@ -162,8 +166,9 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries:
-                logger.warning("第 %d 次尝试失败，%0.1f 秒后重试: %s", attempt + 1, _RETRY_DELAY, exc)
-                time.sleep(_RETRY_DELAY)
+                delay = _BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning("第 %d 次尝试失败，%.1f 秒后重试: %s", attempt + 1, delay, exc)
+                time.sleep(delay)
     raise last_exc
 
 REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
@@ -214,48 +219,32 @@ class AgentService:
     def __init__(self, session_manager: SessionManager):
         self.session_manager = session_manager
         self._dify: DifyChatflowClient | None = None
-        self._llm: AsyncOpenAI | None = None
 
     async def _get_dify(self) -> DifyChatflowClient:
         if self._dify is None:
             self._dify = DifyChatflowClient()
         return self._dify
 
-    def _get_llm(self) -> AsyncOpenAI:
-        if self._llm is None:
-            self._llm = AsyncOpenAI(
-                api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-                base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-            )
-        return self._llm
-
     async def chat(self, user_id: str, message: str) -> dict:
         session = await self.session_manager.get_or_create_async(user_id)
         dify = await self._get_dify()
 
-        try:
-            resp = await dify.chat(
-                query=message,
-                user_id=user_id,
-                conversation_id=session.conversation_id,
-            )
-            session.conversation_id = resp.get("conversation_id")
-            answer = resp.get("answer", "")
-            source = "dify"
-        except Exception as exc:
-            logger.warning("Dify 调用失败，使用兜底 Agent: %s", exc)
-            fallback = await self._fallback(user_id, message)
-            answer = fallback["answer"]
-            source = fallback["source"]
+        resp = await dify.chat(
+            query=message,
+            user_id=user_id,
+            conversation_id=session.conversation_id,
+        )
+        session.conversation_id = resp.get("conversation_id")
+        answer = resp.get("answer", "")
 
         session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
-        session.history.append({"role": "assistant", "content": answer, "source": source, "timestamp": int(time.time())})
+        session.history.append({"role": "assistant", "content": answer, "source": "dify", "timestamp": int(time.time())})
         await self.session_manager._save_session(session)
         return {
             "user_id": user_id,
             "answer": answer,
             "conversation_id": session.conversation_id,
-            "source": source,
+            "source": "dify",
         }
 
     async def chat_stream(self, user_id: str, message: str) -> AsyncGenerator[str, None]:
@@ -263,46 +252,32 @@ class AgentService:
         dify = await self._get_dify()
         full_answer = ""
 
-        try:
-            async for chunk in dify.chat_stream(
-                query=message,
-                user_id=user_id,
-                conversation_id=session.conversation_id,
-            ):
-                event = chunk.get("event")
-                if event == "message":
-                    chunk_text = chunk.get("answer", "")
-                    full_answer += chunk_text
-                    yield json.dumps({
-                        "event": "message",
-                        "answer": chunk_text,
-                        "source": "dify",
-                    }) + "\n"
-                elif event == "message_end":
-                    session.conversation_id = chunk.get("conversation_id")
-                    session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
-                    session.history.append({"role": "assistant", "content": full_answer, "source": "dify", "timestamp": int(time.time())})
-                    await self.session_manager._save_session(session)
-                    yield json.dumps({
-                        "event": "message_end",
-                        "conversation_id": chunk.get("conversation_id"),
-                    }) + "\n"
-                    return
-                elif event == "error":
-                    raise RuntimeError(chunk.get("message", "Dify stream error"))
-        except Exception as exc:
-            logger.warning("Dify 流式调用失败，使用兜底 Agent: %s", exc)
-            fallback_answer = await self._fallback(user_id, message)
-            full_answer = fallback_answer["answer"]
-            yield json.dumps({
-                "event": "message",
-                "answer": full_answer,
-                "source": "agent",
-            }) + "\n"
-            session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
-            session.history.append({"role": "assistant", "content": full_answer, "source": "agent", "timestamp": int(time.time())})
-            await self.session_manager._save_session(session)
-            yield json.dumps({"event": "message_end"}) + "\n"
+        async for chunk in dify.chat_stream(
+            query=message,
+            user_id=user_id,
+            conversation_id=session.conversation_id,
+        ):
+            event = chunk.get("event")
+            if event == "message":
+                chunk_text = chunk.get("answer", "")
+                full_answer += chunk_text
+                yield json.dumps({
+                    "event": "message",
+                    "answer": chunk_text,
+                    "source": "dify",
+                }) + "\n"
+            elif event == "message_end":
+                session.conversation_id = chunk.get("conversation_id")
+                session.history.append({"role": "user", "content": message, "timestamp": int(time.time())})
+                session.history.append({"role": "assistant", "content": full_answer, "source": "dify", "timestamp": int(time.time())})
+                await self.session_manager._save_session(session)
+                yield json.dumps({
+                    "event": "message_end",
+                    "conversation_id": chunk.get("conversation_id"),
+                }) + "\n"
+                return
+            elif event == "error":
+                raise RuntimeError(chunk.get("message", "Dify stream error"))
 
     async def analyze_requirement(self, user_id: str, requirement: dict, ticket_id: str | None = None) -> dict:
         """需求分析：将客户需求转化为结构化需求简报"""
@@ -557,51 +532,4 @@ class AgentService:
             finally:
                 clear_context()
 
-    async def _call_llm(self, system_prompt: str, input_data: dict) -> dict:
-        llm = self._get_llm()
-        prompt = f"""基于以下输入数据，按要求输出 JSON 格式结果：
 
-{json.dumps(input_data, ensure_ascii=False, indent=2)}
-
-请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。"""
-
-        try:
-            resp = await llm.chat.completions.create(
-                model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-            )
-            content = resp.choices[0].message.content.strip()
-            if "</think>" in content:
-                content = content.split("</think>", 1)[1].strip()
-            
-            # 提取 JSON 内容（处理 LLM 可能返回的额外文本）
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            if json_start != -1 and json_end > json_start:
-                content = content[json_start:json_end]
-            else:
-                logger.error("LLM 响应中未找到 JSON 内容，原始输出: %s", content[:200])
-                return {"status": "failed", "error": "LLM 响应格式无效"}
-            
-            result = _parse_json_safe(content)
-            if result is None:
-                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
-            return {"status": "completed", "data": result}
-        except json.JSONDecodeError as exc:
-            logger.error("LLM JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
-            return {"status": "failed", "error": f"LLM 格式错误: {str(exc)}"}
-        except Exception as exc:
-            logger.error("LLM 调用失败: %s", exc)
-            return {"status": "failed", "error": str(exc)}
-
-    async def _fallback(self, user_id: str, message: str) -> dict:
-        return {
-            "user_id": user_id,
-            "answer": f"抱歉，智能客服系统暂时不可用。您的问题是：「{message}」，已转人工处理。",
-            "conversation_id": None,
-            "source": "agent",
-        }

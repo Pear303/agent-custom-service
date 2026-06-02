@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .core.config import settings
 from .utils.file_manager import _save_report
 
 if TYPE_CHECKING:
@@ -20,7 +21,15 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 class TaskQueue:
     """异步任务队列管理器"""
 
-    def __init__(self, db: Database, agent_service: AgentService, maxsize: int = 100, num_workers: int = 3):
+    def __init__(
+        self,
+        db: Database,
+        agent_service: AgentService,
+        maxsize: int | None = None,
+        num_workers: int | None = None,
+    ):
+        maxsize = maxsize if maxsize is not None else settings.task_queue_size
+        num_workers = num_workers if num_workers is not None else settings.task_workers
         self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
         self.db = db
         self.agent_service = agent_service

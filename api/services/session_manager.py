@@ -1,8 +1,8 @@
 """多用户会话管理器 —— 支持过期清理 + 容量限制 + SQLite 持久化"""
 from __future__ import annotations
 
+import asyncio
 import time
-import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -29,7 +29,7 @@ class SessionManager:
         self.max_sessions = max_sessions
         self.db = db
         self._sessions: dict[str, Session] = {}
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
     async def load_from_db(self):
         """启动时，从数据库恢复活跃会话"""
@@ -64,21 +64,21 @@ class SessionManager:
 
     async def cleanup_expired(self) -> int:
         """清理过期会话（内存 + 数据库）"""
-        with self._lock:
+        async with self._lock:
             now = time.time()
             cutoff = now - self.timeout_minutes * 60
             expired = [uid for uid, s in self._sessions.items() if s.last_active < cutoff]
             for uid in expired:
                 del self._sessions[uid]
-        
+
         db_cleaned = 0
         if self.db:
             db_cleaned = await self.db.cleanup_expired_sessions(self.timeout_minutes)
-        
+
         return len(expired) + db_cleaned
 
-    def get_or_create(self, user_id: str) -> Session:
-        with self._lock:
+    async def get_or_create(self, user_id: str) -> Session:
+        async with self._lock:
             if user_id not in self._sessions:
                 if len(self._sessions) >= self.max_sessions:
                     self._evict_expired()
@@ -92,17 +92,17 @@ class SessionManager:
 
     async def get_or_create_async(self, user_id: str) -> Session:
         """异步版本：获取或创建会话，并持久化到数据库"""
-        session = self.get_or_create(user_id)
+        session = await self.get_or_create(user_id)
         await self._save_session(session)
         return session
 
-    def reset(self, user_id: str) -> None:
-        with self._lock:
+    async def reset(self, user_id: str) -> None:
+        async with self._lock:
             self._sessions.pop(user_id, None)
 
     async def reset_async(self, user_id: str) -> None:
         """异步版本：重置会话并从数据库删除"""
-        self.reset(user_id)
+        await self.reset(user_id)
         await self._delete_session(user_id)
 
     def active_count(self) -> int:

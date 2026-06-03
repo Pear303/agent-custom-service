@@ -28,11 +28,14 @@ python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
 
 # 前端开发模式（另开终端）
 cd frontend; npm run dev   # Vite → http://localhost:5173
-$env:DEV_MODE="true"       # 告知后端不挂载静态文件（已默认）
+$env:DEV_MODE="true"
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
 
 # 或使用 CLI 交互模式
 python agent.py
+
+# 打开dify工作界面
+localhost/app
 ```
 
 ## 项目结构

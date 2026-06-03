@@ -38,30 +38,26 @@ python agent.py
 ## 项目结构
 
 ```
-agent.py                  CLI 入口
+agent.py                  CLI 入口（LangChain Agent）
+agent_lg.py               CLI 入口（LangGraph Agent）
 api/                      FastAPI 服务层（开发与业务分离）
 ├── main.py               应用入口、SSE 流式输出、路由挂载
-├── core/                 核心基础设施（配置、数据库、生命周期）
-├── routers/              路由模块（health、chat、session、task）
-├── services/             业务逻辑层（Agent 服务、会话管理）
+├── core/                 核心基础设施
+│   ├── config.py         环境变量配置
+│   ├── database.py       异步 SQLite 数据库
+│   ├── lifespan.py       应用生命周期
+│   └── rate_limit.py     速率限制中间件
+├── routers/              路由模块（health、chat、session、task、dify_tools）
+├── services/             业务逻辑层
+│   ├── agent_service.py  Agent 服务编排
+│   └── session_manager.py 会话管理
+├── repositories/         数据访问层（会话、工单）
 ├── clients/              外部服务客户端（Dify）
+├── tools/                客服工具集（工单、转人工、商品目录、通知）
 ├── task_queue.py          异步任务队列（Worker Pool）
 ├── schemas/              请求/响应模型（Pydantic）
 └── utils/                工具函数（文件管理、进度计算）
-frontend/                 Vue 3 前端（前后端分离，独立构建）
-├── src/
-│   ├── main.ts           Vue 应用入口
-│   ├── App.vue           根组件（Header + Tabs + Router View）
-│   ├── api/              API 层（chat.ts SSE 流式引擎、task.ts 工单 CRUD）
-│   ├── stores/           Pinia 状态管理（user、chat、ticket、toast）
-│   ├── router/           Vue Router（/、/requirement、/ticket/:id）
-│   ├── views/            页面组件（ChatView、RequirementView、TicketDetailView）
-│   ├── components/       UI 组件（ChatMessage、ChatInput、TicketCard 等）
-│   ├── types/            TypeScript 类型定义
-│   └── assets/           CSS 设计系统（27 个 Design Token）
-├── vite.config.ts        Vite 构建配置（@ 别名、API 代理）
-└── package.json          依赖清单（Vue 3、Pinia、Vue Router、Axios）
-agent/                    Agent 核心逻辑
+agent/                    Agent 核心逻辑（LangChain 实现）
 ├── lc_agent.py           主 Agent 循环（LCAgent）
 ├── lc_tools.py           工具定义（@tool 函数）
 ├── subagent_parallel.py  子代理只读工具并发执行器
@@ -76,8 +72,26 @@ agent/                    Agent 核心逻辑
 └── subagents/
     ├── registry.py       子代理注册表（工具白名单 + max_turns）
     └── spec.py           子代理规格定义
-
-static/                   遗留静态资源（旧版单文件前端，保留兼容）
+agent_by_langgraph/       Agent 核心逻辑（LangGraph 实现）
+├── lg_agent.py           LangGraph Agent 循环
+├── lg_graph.py           状态图定义
+├── lg_subagent.py        子代理并发执行
+├── lg_tools.py           工具定义
+└── factory.py            Agent 工厂
+frontend/                 Vue 3 前端（前后端分离，独立构建）
+├── src/
+│   ├── main.ts           Vue 应用入口
+│   ├── App.vue           根组件（Header + Tabs + Router View）
+│   ├── api/              API 层（chat.ts SSE 流式引擎、task.ts 工单 CRUD）
+│   ├── stores/           Pinia 状态管理（user、chat、ticket、toast）
+│   ├── router/           Vue Router（/、/requirement、/ticket/:id）
+│   ├── views/            页面组件（ChatView、RequirementView、TicketDetailView）
+│   ├── components/       UI 组件（ChatMessage、ChatInput、TicketCard 等）
+│   ├── types/            TypeScript 类型定义
+│   └── assets/           CSS 设计系统（27 个 Design Token）
+├── vite.config.ts        Vite 构建配置（@ 别名、API 代理）
+└── package.json          依赖清单（Vue 3、Pinia、Vue Router、Axios）
+static/                   静态文件目录（保留兼容）
 templates/                身份/引导与提示词模板
 ├── SOUL.md               Agent 身份引导
 ├── SOUL_CS.md            客服身份引导
@@ -87,11 +101,9 @@ templates/                身份/引导与提示词模板
 services/                 外部服务集成
 └── dify/                 Dify 智能客服客户端
 scripts/                  工具脚本（数据库迁移、数据校验等）
-tests/                    测试套件
+skills/                   可插拔技能包（基础技能随仓库分发）
 Dockerfile                Docker 容器镜像
 docker-compose.yml        Docker Compose 编排
-skills/                   可插拔技能包
-data/                     数据存储（数据库文件、用户数据等）
 ```
 
 ## 三层记忆
@@ -202,10 +214,16 @@ npx clawhub install word-docx         # Word 文档
 
 ## 环境变量
 
-| 变量 | 说明 |
-|------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API Key |
-| `DEEPSEEK_BASE_URL` | API 地址（默认 https://api.deepseek.com） |
-| `DEEPSEEK_MODEL` | 使用的模型（默认 deepseek-v4-flash） |
-
-其余环境变量请查看 `.env.example`。
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEEPSEEK_API_KEY` | — | DeepSeek API Key |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址 |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | DeepSeek 模型名 |
+| `ZHIPU_API_KEY` | — | 智谱 AI API Key |
+| `ZHIPU_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4` | 智谱 AI API 地址 |
+| `ZHIPU_MODEL` | `GLM-4.7-Flash` | 智谱 AI 模型名 |
+| `DIFY_BASE_URL` | `http://127.0.0.1:80` | Dify 服务地址 |
+| `DIFY_API_KEY` | — | Dify API Key |
+| `SERVICE_PORT` | `8000` | 服务监听端口 |
+| `SESSION_TIMEOUT_MINUTES` | `30` | 会话超时时间（分钟） |
+| `MAX_SESSIONS` | `1000` | 最大并发会话数 |

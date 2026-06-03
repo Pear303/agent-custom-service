@@ -19,6 +19,10 @@ langchain_huggingface>=1.2.2
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 sse-starlette>=2.1.0
+aiosqlite>=0.20.0
+
+# 向量存储
+chromadb>=1.10.0
 
 # 测试
 pytest>=9.0

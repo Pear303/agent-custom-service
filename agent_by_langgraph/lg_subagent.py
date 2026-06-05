@@ -5,6 +5,10 @@
 并发执行：
   子图使用 ParallelToolNode 替代标准 ToolNode，支持同一帧内多个只读工具
   并发执行。ContextVar 通过快照-恢复机制在工作线程间传播。
+
+异步节点：
+  call_subagent 使用 async def + ainvoke，I/O 等待期间释放事件循环，
+  允许同一 superstep 中无依赖的节点并发执行。
 """
 from __future__ import annotations
 
@@ -87,7 +91,7 @@ def create_subagent_graph(llm, spec: SubagentSpec):
     llm_with_tools = llm.bind_tools(tools)
     tool_node = ParallelToolNode(tools)
 
-    def call_subagent(state: SubagentState, config: RunnableConfig) -> dict:
+    async def call_subagent(state: SubagentState, config: RunnableConfig) -> dict:
         # 首轮：构建 [SystemMessage, HumanMessage(input)] 作为起始
         # 后续轮次：state["messages"] 已包含前一轮的完整消息序列
         # （含 SystemMessage），通过 add_messages reducer 自动累积，
@@ -103,7 +107,7 @@ def create_subagent_graph(llm, spec: SubagentSpec):
             # 后续轮次：existing 已含 SystemMessage + HumanMessage + AIMessage + ToolMessage
             # 直接使用，不重复注入 SystemMessage
             msgs = list(existing)
-        response = llm_with_tools.invoke(msgs, config=config)
+        response = await llm_with_tools.ainvoke(msgs, config=config)
         return {"messages": [response]}
 
     builder = StateGraph(SubagentState)

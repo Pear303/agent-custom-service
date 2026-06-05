@@ -8,12 +8,17 @@ ContextVar 传播方案：
   Python 的 ThreadPoolExecutor 不会自动传播 ContextVar，因此
   在提交任务前捕获当前线程的 ContextVar 快照，在工作线程内恢复。
 
+异步执行（ainvoke）：
+  ainvoke 使用 asyncio.gather 替代 ThreadPoolExecutor 实现只读工具并发，
+  避免线程池开销，与 async 节点函数配合更高效。
+
 兼容性：
   LangGraph >= 1.2 的 add_node 要求传入 Runnable 或 callable，
   因此 ParallelToolNode 实现 __call__ 使其可作为 callable 节点使用。
 """
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
@@ -91,6 +96,99 @@ class ParallelToolNode:
     def __call__(self, state: dict, config: RunnableConfig) -> dict:
         """LangGraph add_node 要求 callable 签名：fn(state, config) -> dict。"""
         return self.invoke(state, config)
+
+    async def ainvoke(self, state: dict, config: RunnableConfig | None = None) -> dict:
+        """异步执行工具调用，只读工具用 asyncio.gather 并发。
+
+        与 invoke 行为一致，但使用 asyncio.gather 替代 ThreadPoolExecutor，
+        避免线程池开销，与 async 节点函数配合更高效。
+        """
+        messages = state.get("messages", [])
+        if not messages:
+            return {"messages": []}
+
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+            return {"messages": []}
+
+        tool_calls = last_msg.tool_calls
+
+        # 单个 tool_call → 直接走 ToolNode，无并发开销
+        if len(tool_calls) <= 1:
+            return await self._tool_node.ainvoke(state, config)
+
+        # 分类：只读 vs 非只读
+        read_only_calls = [tc for tc in tool_calls if tc["name"] in _READ_ONLY_TOOLS]
+        write_calls = [tc for tc in tool_calls if tc["name"] not in _READ_ONLY_TOOLS]
+
+        # 如果没有多个只读工具需要并发，直接走 ToolNode
+        if len(read_only_calls) <= 1:
+            return await self._tool_node.ainvoke(state, config)
+
+        # 有多个只读工具 → 并发执行
+        results: list[ToolMessage] = []
+
+        # 先顺序执行非只读工具（通过 ToolNode）
+        if write_calls:
+            write_ai_msg = AIMessage(
+                content=last_msg.content or "",
+                tool_calls=write_calls,
+                additional_kwargs=last_msg.additional_kwargs,
+                id=last_msg.id,
+            )
+            write_state = {"messages": list(messages[:-1]) + [write_ai_msg]}
+            write_result = await self._tool_node.ainvoke(write_state, config)
+            results.extend(write_result.get("messages", []))
+
+        # 并发执行只读工具（asyncio.gather）
+        if read_only_calls and len(read_only_calls) >= 2:
+            if self._verbose:
+                names = ", ".join(tc["name"] for tc in read_only_calls)
+                print(f"\n[异步并发执行 {len(read_only_calls)} 个只读工具]: {names}\n")
+
+            async def _run_single_async(tc: dict) -> ToolMessage:
+                """异步执行单个工具调用。"""
+                tool = self._name_to_tool.get(tc["name"])
+                if tool is None:
+                    return ToolMessage(
+                        content=f"Error: unknown tool '{tc['name']}'",
+                        tool_call_id=tc["id"],
+                        name=tc["name"],
+                        status="error",
+                    )
+                try:
+                    observation = await tool.ainvoke(tc["args"])
+                    return ToolMessage(
+                        content=str(observation),
+                        tool_call_id=tc["id"],
+                        name=tc["name"],
+                    )
+                except Exception as exc:
+                    return ToolMessage(
+                        content=f"Error: {exc}",
+                        tool_call_id=tc["id"],
+                        name=tc["name"],
+                        status="error",
+                    )
+
+            parallel_results = await asyncio.gather(
+                *[_run_single_async(tc) for tc in read_only_calls]
+            )
+            results.extend(parallel_results)
+
+        elif read_only_calls:
+            # 只有一个只读工具，走 ToolNode
+            single_ai_msg = AIMessage(
+                content=last_msg.content or "",
+                tool_calls=read_only_calls,
+                additional_kwargs=last_msg.additional_kwargs,
+                id=last_msg.id,
+            )
+            single_state = {"messages": list(messages[:-1]) + [single_ai_msg]}
+            single_result = await self._tool_node.ainvoke(single_state, config)
+            results.extend(single_result.get("messages", []))
+
+        return {"messages": results}
 
     def invoke(self, state: dict, config: RunnableConfig | None = None) -> dict:
         """执行工具调用，只读工具并发，非只读工具顺序。"""

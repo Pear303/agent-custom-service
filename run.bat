@@ -52,7 +52,7 @@ timeout /t 3 /nobreak >nul
 
 REM -- 启动后端（新窗口） ----------------------------------------
 echo [..] 启动后端 API (http://localhost:8080)...
-start "SmartCS Backend" cmd /c "cd /d %~dp0 && %PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent"
+start "SmartCS Backend" cmd /c "cd /d %~dp0 && %PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent --no-access-log"
 
 REM -- 打开浏览器 -------------------------------------------------
 timeout /t 2 /nobreak >nul
@@ -109,6 +109,6 @@ echo =========================================
 echo.
 
 :start
-%PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent
+%PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent --no-access-log
 
 pause

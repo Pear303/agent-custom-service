@@ -132,12 +132,15 @@ def _resolve(path: str) -> Path:
 
     import logging as _logging
     _logging.getLogger(__name__).critical(
-        "_resolve: _ctx_workspace is None — 文件将解析到 CWD！"
+        "_resolve: _ctx_workspace is None — 拒绝文件写入！"
         " path=%s, thread=%s, user_id=%s, ticket_id=%s",
         str(p), __import__("threading").get_ident(),
         _ctx_user_id.get(), _ctx_ticket_id.get(),
     )
-    return p.resolve()
+    raise RuntimeError(
+        f"工作区未初始化，拒绝写入文件 '{path}'。"
+        f" (user_id={_ctx_user_id.get()}, ticket_id={_ctx_ticket_id.get()})"
+    )
 
 
 # ── 内部帮助函数 ──────────────────────────────────────────────────
@@ -396,9 +399,16 @@ def read_file(path: str, offset: int = 1, limit: Optional[int] = None) -> str:
 def write_file(path: str, content: str) -> str:
     """写入文件（覆盖已有内容）。部分编辑请用 edit_file。
     Args:
-        path: 文件路径（相对于工作区）
+        path: 文件路径（相对于工作区，如 \"index.html\" 或 \"css/style.css\"）
         content: 要写入的文件内容
     """
+    _FORBIDDEN_PREFIXES = ("data/", "data\\", "_build", "-p", "node_modules")
+    stripped = path.lstrip("/\\")
+    if any(stripped.startswith(prefix) for prefix in _FORBIDDEN_PREFIXES):
+        return (
+            f"Error: 路径 '{path}' 包含系统保留前缀，已被拒绝。"
+            f" 请使用相对于项目目录的路径，例如 'index.html'、'css/style.css'。"
+        )
     try:
         fp = _resolve(path)
         fp.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在

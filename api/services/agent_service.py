@@ -265,6 +265,8 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     与 _invoke_in_thread 类似，但使用 LangGraph StateGraph 替代 AgentExecutor。
     由于 asyncio.to_thread 不会自动传播 ContextVar，需要在新线程中显式恢复。
 
+    节点函数已改为 async def，因此使用 asyncio.run(ainvoke) 替代同步 invoke。
+
     Checkpointer 利用策略：
     - 首轮（agent._first_turn=True）：传入完整上下文 [SystemMessage, ...chat_history, HumanMessage]
     - 后续轮次（agent._first_turn=False）：只传入 [HumanMessage]，
@@ -278,8 +280,9 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
         output_subdir: 未使用（保持接口兼容）
 
     Returns:
-        dict: {"output": 回复文本}
+        dict: {"output": 回复文本} 或 {"output": ..., "interrupt": ...}（需要审批时）
     """
+    import asyncio
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
     from agent_by_langgraph.lg_agent import ReasoningCollector
     from agent.lc_tools import (
@@ -331,17 +334,30 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     # 合并图级回调（TokenTracker）和 per-invoke 回调（ReasoningCollector）
     all_callbacks = list(getattr(agent.graph, '_lg_llm_callbacks', []))
     all_callbacks.append(collector)
+    config = {
+        "callbacks": all_callbacks,
+        "recursion_limit": agent.max_iterations * 2 + 5,
+        "configurable": {"thread_id": agent.user_id or "default"},
+    }
     try:
-        result = agent.graph.invoke(
-            input_state,
-            config={
-                "callbacks": all_callbacks,
-                "recursion_limit": agent.max_iterations * 2 + 5,
-                "configurable": {"thread_id": agent.user_id or "default"},
-            },
-        )
+        # 节点函数为 async def，使用 asyncio.run(ainvoke)
+        result = asyncio.run(agent.graph.ainvoke(input_state, config=config))
     finally:
         clear_context()
+
+    # 检查是否有中断（interrupt_approval 节点暂停）
+    # __interrupt__ 是 LangGraph 在 interrupt() 后自动添加到结果中的字段
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        logger.info("[LG Invoke] 执行被中断，等待人工审批: %s", interrupts)
+        return {
+            "output": "",
+            "interrupt": {
+                "type": "dangerous_tool_approval",
+                "data": interrupts,
+                "thread_id": config["configurable"]["thread_id"],
+            },
+        }
 
     # 优先使用 ReasoningCollector 收集的完整 AIMessage（含 reasoning_content）
     collector_msg = collector.last
@@ -373,6 +389,62 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
 
     logger.info("[LG Invoke] 完成, reply 长度=%d", len(reply))
     return {"output": reply}
+
+
+def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
+    """恢复被 interrupt() 暂停的 LangGraph Agent 执行。
+
+    当 interrupt_approval 节点暂停执行后，调用方通过此函数恢复：
+    - decision="approve": 放行危险工具调用
+    - decision="reject": 拒绝危险工具调用
+
+    Args:
+        agent: LangGraphAgent 实例
+        decision: 审批决定 ("approve" 或 "reject")
+        thread_id: 被中断的线程 ID（用于恢复正确的 checkpoint）
+
+    Returns:
+        dict: {"output": 回复文本}
+    """
+    import asyncio
+    from langgraph.types import Command
+
+    config = {
+        "recursion_limit": agent.max_iterations * 2 + 5,
+        "configurable": {"thread_id": thread_id},
+    }
+
+    # 恢复 ContextVar
+    from agent.lc_tools import (
+        _ctx_workspace, _ctx_skills_loader, _ctx_todo_store,
+        _ctx_subagent_registry, _ctx_llm_ref, _ctx_user_id, _ctx_ticket_id,
+    )
+    _ctx_workspace.set(agent._ctx_snapshot.get("workspace"))
+    _ctx_skills_loader.set(agent._ctx_snapshot.get("skills_loader"))
+    _ctx_todo_store.set(agent._ctx_snapshot.get("todo_store"))
+    _ctx_subagent_registry.set(agent._ctx_snapshot.get("subagent_registry"))
+    _ctx_llm_ref.set(agent._ctx_snapshot.get("llm_ref"))
+    _ctx_user_id.set(agent._ctx_snapshot.get("user_id"))
+    _ctx_ticket_id.set(agent._ctx_snapshot.get("ticket_id"))
+
+    try:
+        result = asyncio.run(
+            agent.graph.ainvoke(Command(resume=decision), config=config)
+        )
+    finally:
+        clear_context()
+
+    messages = result.get("messages", [])
+    reply = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            content = msg.content
+            reply = content if isinstance(content, str) else str(content)
+            break
+
+    logger.info("[LG Resume] 审批恢复完成, decision=%s, reply 长度=%d", decision, len(reply))
+    return {"output": reply}
+
 
 REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
 
@@ -652,11 +724,55 @@ class AgentService:
 3. **配置文件**：package.json / requirements.txt 等
 4. **README**：项目说明和运行指南
 
+⚠️ 重要约束：在本任务中，禁止使用 write_file 工具写文件。
+你必须将所有代码内容包含在最终 JSON 输出的 files 字段中，
+由系统后端统一写入文件系统。
+
 最后输出开发结果（JSON 格式），包含：
 - project_structure: 项目目录结构（树形文本）
-- files: 生成的文件列表（路径 + 内容）
+- files: 生成的文件列表 [{path: "相对路径", content: "文件完整内容"}, ...]
 - tech_stack: 使用的技术栈
-- setup_instructions: 安装和运行步骤"""
+- setup_instructions: 安装和运行步骤
+
+输出要求：只输出 JSON，不要输出任何其他解释性文字。"""
+
+    def _recover_from_build(self, user_id: str, ticket_id: str) -> dict | None:
+        _build_dir = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "_build"
+        if not _build_dir.exists():
+            return None
+        scanned_files: list[dict] = []
+        blacklist_prefixes = (
+            str(_build_dir / "data"),
+            str(_build_dir / "-p"),
+        )
+        for fp in _build_dir.rglob("*"):
+            if not fp.is_file():
+                continue
+            fp_str = str(fp)
+            if any(fp_str.startswith(prefix) for prefix in blacklist_prefixes):
+                continue
+            try:
+                rel = fp.relative_to(_build_dir)
+            except ValueError:
+                continue
+            try:
+                fc = fp.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if not fc.strip():
+                continue
+            scanned_files.append({"path": str(rel.as_posix()), "content": fc})
+        if not scanned_files:
+            return None
+        scanned_files.sort(key=lambda entry: entry["path"])
+        logger.info("从 _build 恢复 %d 个文件", len(scanned_files))
+        return {
+            "project_structure": "从 _build 目录恢复",
+            "files": scanned_files,
+            "tech_stack": "从 _build 恢复（未知）",
+            "setup_instructions": "请参考项目 README",
+            "_recovered_from_build": True,
+        }
 
     async def develop_project(self, user_id: str, project_data: dict, ticket_id: str | None = None) -> dict:
         if _USE_LANGGRAPH:
@@ -702,13 +818,16 @@ class AgentService:
                 json_end = content.rfind('}') + 1
                 if json_start != -1 and json_end > json_start:
                     content = content[json_start:json_end]
+                    data = _parse_json_safe(content)
+                    if data is None:
+                        raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
                 else:
-                    logger.error("开发响应中未找到 JSON 内容，原始输出: %s", content[:200])
-                    return {"status": "failed", "error": "开发响应格式无效"}
-                
-                data = _parse_json_safe(content)
-                if data is None:
-                    raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
+                    # fallback: 从 _build 目录扫描 LLM 实际写出的文件
+                    logger.warning("开发响应中未找到 JSON 内容，尝试从 _build 恢复")
+                    data = self._recover_from_build(user_id, ticket_id)
+                    if data is None:
+                        logger.error("开发响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                        return {"status": "failed", "error": "开发响应格式无效"}
 
                 # 将 LLM 生成的代码文件写入 data/users/{user_id}/{ticket_id}/成品/
                 files = data.get("files")

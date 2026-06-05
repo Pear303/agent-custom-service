@@ -23,6 +23,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+# 关闭 uvicorn 的 HTTP 请求访问日志（形如 "INFO: 127.0.0.1 - GET /xxx HTTP/1.1 200 OK"）
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 # ── 服务实例化 ──────────────────────────────────────────────
 db = Database()
 session_manager = SessionManager(

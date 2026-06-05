@@ -60,12 +60,12 @@ def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
 def dispatch_subagent_lg(agent_type: str, task: str) -> str:
     """派遣子代理独立处理任务（LangGraph StateGraph 实现）。
 
-    与原版 `agent.lc_tools.dispatch_subagent` 的区别：
-    - 子代理用独立 StateGraph 子图（`create_subagent_graph`），不依赖 AgentExecutor
-    - max_turns 在子图 `post_tools` 节点递减，每轮 agent→tools 循环计 1
-    - 只读工具通过 ParallelToolNode 并发执行（与原版 ParallelAgentExecutor 行为一致）
+    当 LLM 在同一帧发出多个 dispatch_subagent_lg 调用时，
+    图路由器（route_after_agent）会将它们转为并行 Send，
+    由 subagent_worker 节点在同一 superstep 内并行执行，
+    而非逐个串行阻塞。
 
-    办完只回传最后一条 AIMessage 的文本内容（与原版行为一致）。
+    单个调用时也走 Send 路径，保持一致性。
 
     agent_type 可用值: quick_helper, web_researcher, doc_analyzer,
     engine_executor, validator, skill_manager, document_processor,
@@ -76,8 +76,13 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
         task: 委派给子代理的具体任务描述
 
     Returns:
-        子代理的最终文本回复（错误时返回以 "Error:" 开头的诊断信息）
+        此函数体不再执行实际逻辑（由 subagent_worker 节点完成），
+        保留此 tool 定义是为了让 LLM 知道可以调用它。
     """
+    # 实际执行由 subagent_dispatcher + subagent_worker 节点完成。
+    # 此函数体不会被调用——route_after_agent 拦截 dispatch_subagent_lg
+    # 的 tool_calls，不走 tools 节点，走 subagent_dispatcher。
+    # 但作为 fallback（如直接 invoke 工具时），保留同步执行逻辑。
     from agent.lc_tools import _ctx_llm_ref, _ctx_subagent_registry
     from agent_by_langgraph.lg_subagent import get_subagent_graph
 
@@ -93,7 +98,7 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
         available = ", ".join(registry.names())
         return f"Error: unknown subagent '{agent_type}'. Available: {available}"
 
-    print(f"\n[LG 派遣子代理 · {agent_type}]: {task[:80]}")
+    print(f"\n[LG 派遣子代理(fallback) · {agent_type}]: {task[:80]}")
 
     try:
         subgraph = get_subagent_graph(llm, registry, agent_type)

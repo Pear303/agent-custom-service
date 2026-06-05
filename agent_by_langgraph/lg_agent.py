@@ -275,6 +275,8 @@ class LangGraphAgent:
         - 后续轮次（_first_turn=False）：只传入 [HumanMessage]，
           checkpointer 自动恢复之前的 state（含 SystemMessage + 历史消息），
           add_messages reducer 将新 HumanMessage 追加到已有消息序列末尾。
+
+        注意：由于节点函数已改为 async def，需要用 asyncio.run() 包装 ainvoke。
         """
         while True:
             try:
@@ -318,10 +320,23 @@ class LangGraphAgent:
                 # checkpointer 自动恢复之前的 state
                 input_state = {"messages": [HumanMessage(content=user_input)]}
 
-            result = self.graph.invoke(
-                input_state,
-                config=config,
-            )
+            # 节点函数为 async def，需要用 asyncio.run 包装 ainvoke
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # 已在事件循环中（不应出现在 REPL，但防御性处理）
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(
+                        asyncio.run,
+                        self.graph.ainvoke(input_state, config=config)
+                    ).result()
+            else:
+                result = asyncio.run(self.graph.ainvoke(input_state, config=config))
             print()  # 流式结束换行
 
             messages = result["messages"]

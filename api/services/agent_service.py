@@ -17,7 +17,37 @@ from ..utils.file_manager import _clean_output_path
 from agent.factory import create_agent
 from agent.lc_tools import set_workspace, set_skills_loader, set_todo_store, set_subagent_deps, set_user_id, set_ticket_id, clear_context, _build_workspace
 
+# LangGraph Agent 支持（可选，需安装 langgraph-checkpoint-sqlite）
+_USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() in ("true", "1", "yes")
+
+if _USE_LANGGRAPH:
+    try:
+        from agent_by_langgraph.factory import create_lg_agent
+        from langchain_core.messages import HumanMessage, SystemMessage
+    except ImportError:
+        logger.warning("LangGraph Agent 不可用，回退到 LCAgent")
+        _USE_LANGGRAPH = False
+
+# 启动时检测 Checkpointer 依赖
+if _USE_LANGGRAPH:
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        logger.info("[启动检测] langgraph-checkpoint-sqlite 已安装，Checkpointer 功能可用")
+    except ImportError:
+        logger.warning(
+            "[启动检测] langgraph-checkpoint-sqlite 未安装！"
+            "Agent 将运行但无状态持久化/增量更新能力。"
+            "请运行: pip install langgraph-checkpoint-sqlite>=2.0.0"
+        )
+
 logger = logging.getLogger(__name__)
+
+# 启动时醒目打印当前 Agent 引擎选择
+_AGENT_ENGINE = "LangGraph (StateGraph)" if _USE_LANGGRAPH else "LangChain (AgentExecutor)"
+logger.info("=" * 60)
+logger.info("  Agent 引擎: %s", _AGENT_ENGINE)
+logger.info("  切换方式: 设置 USE_LANGGRAPH=%s", "false" if _USE_LANGGRAPH else "true")
+logger.info("=" * 60)
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
@@ -27,14 +57,70 @@ _MAX_RETRIES = settings.agent_max_retries
 _BASE_DELAY = settings.agent_base_delay
 
 
+def _normalize_cjk_quotes(content: str) -> str:
+    """将中文弯引号（\u201c \u201d \u300c \u300d）替换为转义 ASCII 引号，
+    防止 LLM 在 JSON 字符串值内使用中文引号导致解析截断。"""
+    return content.replace('\u201c', '\\"').replace('\u201d', '\\"').replace('\u300c', '\\"').replace('\u300d', '\\"')
+
+
+def _fix_unescaped_inner_quotes(content: str) -> str:
+    """修复 LLM 在 JSON 字符串值内使用未转义 ASCII 双引号的问题。
+
+    核心思路：逐字符状态机遍历，当在字符串内部遇到 " 时，
+    检查其后是否紧跟合法的 JSON 续接符（, : ] } 或空白后接这些），
+    若否则判定为未转义的内部引号，自动转义为 \"。
+    """
+    result: list[str] = []
+    i = 0
+    in_string = False
+    n = len(content)
+
+    while i < n:
+        ch = content[i]
+
+        if not in_string:
+            result.append(ch)
+            if ch == '"':
+                in_string = True
+        else:
+            if ch == '\\' and i + 1 < n:
+                # 已有转义，原样保留
+                result.append(ch)
+                result.append(content[i + 1])
+                i += 1
+            elif ch == '"':
+                # 判断：字符串结束符 vs 未转义的内部引号
+                rest = content[i + 1:]
+                stripped = rest.lstrip()
+                if not stripped or stripped[0] in ',:]}\r\n':
+                    # 后面是合法 JSON 续接 → 字符串结束
+                    result.append('"')
+                    in_string = False
+                else:
+                    # 后面不是合法续接 → 未转义内部引号
+                    result.append('\\"')
+            else:
+                result.append(ch)
+
+        i += 1
+
+    return ''.join(result)
+
+
 def _parse_json_safe(content: str, _debug_label: str = "") -> dict | None:
     if "</think>" in content:
         content = content.split("</think>", 1)[1].strip()
 
     strategies = [
         lambda c: json.loads(c),
+        lambda c: json.loads(_fix_unescaped_inner_quotes(c)),
+        lambda c: json.loads(_normalize_cjk_quotes(c)),
         lambda c: json.loads(re.sub(r',\s*([}\]])', r'\1', c)),
+        lambda c: json.loads(re.sub(r',\s*([}\]])', r'\1', _fix_unescaped_inner_quotes(c))),
+        lambda c: json.loads(re.sub(r',\s*([}\]])', r'\1', _normalize_cjk_quotes(c))),
         lambda c: _try_truncated_json(c),
+        lambda c: _try_truncated_json(_fix_unescaped_inner_quotes(c)),
+        lambda c: _try_truncated_json(_normalize_cjk_quotes(c)),
         lambda c: json.loads(re.sub(r'(?m)^```(?:json)?\s*\n?|^\s*```\s*$', '', c).strip()),
         lambda c: json.loads(re.sub(r"(?<!\\)'", '"', c)),
         lambda c: _try_truncated_json(re.sub(r"(?<!\\)'", '"', c)),
@@ -115,6 +201,7 @@ def _invoke_in_thread(workspace, user_id, ticket_id, executor, input_data, outpu
                    避免 LLM 的 write_file 与最终输出目录冲突导致路径嵌套。
     """
     effective_ws = _build_workspace(workspace, user_id, ticket_id)
+    logger.debug("[LangChain 执行] user_id=%s, ticket_id=%s", user_id, ticket_id)
     if output_subdir:
         # 使用 _build 临时目录：LLM 在此自由操作，不会污染最终输出目录
         effective_ws = effective_ws / "_build"
@@ -170,6 +257,122 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
                 logger.warning("第 %d 次尝试失败，%.1f 秒后重试: %s", attempt + 1, delay, exc)
                 time.sleep(delay)
     raise last_exc
+
+
+def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
+    """在线程中调用 LangGraph Agent。
+
+    与 _invoke_in_thread 类似，但使用 LangGraph StateGraph 替代 AgentExecutor。
+    由于 asyncio.to_thread 不会自动传播 ContextVar，需要在新线程中显式恢复。
+
+    Checkpointer 利用策略：
+    - 首轮（agent._first_turn=True）：传入完整上下文 [SystemMessage, ...chat_history, HumanMessage]
+    - 后续轮次（agent._first_turn=False）：只传入 [HumanMessage]，
+      checkpointer 自动恢复之前的 state（含 SystemMessage + 历史消息），
+      add_messages reducer 将新 HumanMessage 追加到已有消息序列末尾。
+    - 若 checkpointer 不可用（未安装 langgraph-checkpoint-sqlite），则始终传完整上下文。
+
+    Args:
+        agent: LangGraphAgent 实例
+        prompt: 用户输入
+        output_subdir: 未使用（保持接口兼容）
+
+    Returns:
+        dict: {"output": 回复文本}
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+    from agent_by_langgraph.lg_agent import ReasoningCollector
+    from agent.lc_tools import (
+        _ctx_workspace, _ctx_skills_loader, _ctx_todo_store,
+        _ctx_subagent_registry, _ctx_llm_ref, _ctx_user_id, _ctx_ticket_id,
+    )
+
+    # 在新线程中恢复 ContextVar（asyncio.to_thread 不自动传播）
+    _ctx_workspace.set(agent._ctx_snapshot.get("workspace"))
+    _ctx_skills_loader.set(agent._ctx_snapshot.get("skills_loader"))
+    _ctx_todo_store.set(agent._ctx_snapshot.get("todo_store"))
+    _ctx_subagent_registry.set(agent._ctx_snapshot.get("subagent_registry"))
+    _ctx_llm_ref.set(agent._ctx_snapshot.get("llm_ref"))
+    _ctx_user_id.set(agent._ctx_snapshot.get("user_id"))
+    _ctx_ticket_id.set(agent._ctx_snapshot.get("ticket_id"))
+
+    logger.debug(
+        "[LangGraph 执行] user_id=%s, first_turn=%s, checkpointer=%s",
+        agent.user_id, agent._first_turn, agent.graph.checkpointer is not None,
+    )
+
+    has_checkpointer = agent.graph.checkpointer is not None
+    with agent._turn_lock:
+        is_first_turn = agent._first_turn
+        if is_first_turn and has_checkpointer:
+            agent._first_turn = False
+
+    # 构造输入消息：根据 checkpointer 状态和 _first_turn 决定是否传完整上下文
+    if is_first_turn or not has_checkpointer:
+        # 首轮或无 checkpointer：传入完整上下文
+        initial_messages = [SystemMessage(content=agent._system_prompt)]
+        initial_messages.extend(agent.memory_store.messages)
+        initial_messages.append(HumanMessage(content=prompt))
+        input_state = {"messages": initial_messages}
+        msg_count = len(initial_messages)
+        logger.info(
+            "[LG Invoke] 完整上下文模式: first_turn=%s, checkpointer=%s, "
+            "messages=%d (system=1 + history=%d + input=1)",
+            is_first_turn, has_checkpointer, msg_count, msg_count - 2,
+        )
+    else:
+        # 后续轮次 + checkpointer 可用：只传 HumanMessage，checkpointer 自动恢复
+        input_state = {"messages": [HumanMessage(content=prompt)]}
+        logger.info(
+            "[LG Invoke] 增量模式: 只传 HumanMessage, checkpointer 自动恢复历史状态",
+        )
+
+    collector = ReasoningCollector()
+    # 合并图级回调（TokenTracker）和 per-invoke 回调（ReasoningCollector）
+    all_callbacks = list(getattr(agent.graph, '_lg_llm_callbacks', []))
+    all_callbacks.append(collector)
+    try:
+        result = agent.graph.invoke(
+            input_state,
+            config={
+                "callbacks": all_callbacks,
+                "recursion_limit": agent.max_iterations * 2 + 5,
+                "configurable": {"thread_id": agent.user_id or "default"},
+            },
+        )
+    finally:
+        clear_context()
+
+    # 优先使用 ReasoningCollector 收集的完整 AIMessage（含 reasoning_content）
+    collector_msg = collector.last
+    if collector_msg is not None and collector_msg.content:
+        content = collector_msg.content
+        reply = content if isinstance(content, str) else str(content)
+    else:
+        messages = result.get("messages", [])
+        reply = ""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                content = msg.content
+                reply = content if isinstance(content, str) else str(content)
+                break
+
+    # 持久化到 MemoryStore（与 REPL run() 行为一致）
+    agent.memory_store.append_history("user", prompt)
+    if collector_msg is not None and (reply or collector_msg.additional_kwargs):
+        agent.memory_store.append_history(
+            "assistant", reply,
+            additional_kwargs=collector_msg.additional_kwargs or None,
+        )
+    elif reply:
+        agent.memory_store.append_history("assistant", reply)
+
+    # 压缩检查
+    if agent.token_tracker.should_compact(max_context=200_000, threshold=0.5):
+        agent.compactor.compact_store()
+
+    logger.info("[LG Invoke] 完成, reply 长度=%d", len(reply))
+    return {"output": reply}
 
 REQUIREMENT_ANALYST_PROMPT = """你是需求分析师，负责将客户模糊的原始需求转化为结构化的需求简报。
 
@@ -282,6 +485,10 @@ class AgentService:
     async def analyze_requirement(self, user_id: str, requirement: dict, ticket_id: str | None = None) -> dict:
         """需求分析：将客户需求转化为结构化需求简报"""
         async with _agent_semaphore:
+            if _USE_LANGGRAPH:
+                logger.debug("[引擎路由] 需求分析 → LangGraph | user_id=%s", user_id)
+                return await self._analyze_requirement_lg(user_id, requirement, ticket_id)
+            logger.debug("[引擎路由] 需求分析 → LangChain | user_id=%s", user_id)
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
 
             prompt = f"""基于以下客户需求，按要求输出 JSON 格式的需求分析结果：
@@ -331,6 +538,10 @@ class AgentService:
 
     async def design_prd(self, user_id: str, analysis: dict, ticket_id: str | None = None) -> dict:
         async with _agent_semaphore:
+            if _USE_LANGGRAPH:
+                logger.debug("[引擎路由] PRD设计 → LangGraph | user_id=%s", user_id)
+                return await self._design_prd_lg(user_id, analysis, ticket_id)
+            logger.debug("[引擎路由] PRD设计 → LangChain | user_id=%s", user_id)
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
 
             prompt = f"""基于以下需求分析结果，按要求输出 JSON 格式的 PRD：
@@ -380,6 +591,10 @@ class AgentService:
 
     async def estimate_cost(self, user_id: str, prd: dict, analysis: dict, ticket_id: str | None = None) -> dict:
         async with _agent_semaphore:
+            if _USE_LANGGRAPH:
+                logger.debug("[引擎路由] 成本估算 → LangGraph | user_id=%s", user_id)
+                return await self._estimate_cost_lg(user_id, prd, analysis, ticket_id)
+            logger.debug("[引擎路由] 成本估算 → LangChain | user_id=%s", user_id)
             agent = create_agent(user_id=user_id, ticket_id=ticket_id)
 
             combined = {**prd, **analysis}
@@ -444,6 +659,11 @@ class AgentService:
 - setup_instructions: 安装和运行步骤"""
 
     async def develop_project(self, user_id: str, project_data: dict, ticket_id: str | None = None) -> dict:
+        if _USE_LANGGRAPH:
+            logger.debug("[引擎路由] 项目开发 → LangGraph | user_id=%s", user_id)
+            return await self._develop_project_lg(user_id, project_data, ticket_id)
+        logger.debug("[引擎路由] 项目开发 → LangChain | user_id=%s", user_id)
+
         async with _agent_semaphore:
             agent = create_agent(user_id=user_id, ticket_id=ticket_id, max_iterations=80)
 
@@ -531,5 +751,200 @@ class AgentService:
                 return {"status": "failed", "error": str(exc)}
             finally:
                 clear_context()
+
+    # ── LangGraph Agent 方法 ──────────────────────────────────────
+
+    async def _analyze_requirement_lg(self, user_id: str, requirement: dict, ticket_id: str | None = None) -> dict:
+        """需求分析（LangGraph Agent 版本）"""
+        agent = create_lg_agent(user_id=user_id, ticket_id=ticket_id)
+
+        prompt = f"""基于以下客户需求，按要求输出 JSON 格式的需求分析结果：
+
+{json.dumps(requirement, ensure_ascii=False, indent=2)}
+
+请严格按照以下系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{REQUIREMENT_ANALYST_PROMPT}"""
+
+        try:
+            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            content = result["output"]
+            if "</think>" in content:
+                content = content.split("</think>", 1)[1].strip()
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                return {"status": "failed", "error": "需求分析响应格式无效"}
+            data = _parse_json_safe(content)
+            if data is None:
+                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
+            return {"status": "completed", "data": data}
+        except json.JSONDecodeError as exc:
+            logger.error("LG 需求分析 JSON 解析失败: %s", exc)
+            return {"status": "failed", "error": f"需求分析格式错误: {str(exc)}"}
+        except Exception as exc:
+            logger.error("LG 需求分析失败: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            clear_context()
+
+    async def _design_prd_lg(self, user_id: str, analysis: dict, ticket_id: str | None = None) -> dict:
+        """PRD 设计（LangGraph Agent 版本）"""
+        agent = create_lg_agent(user_id=user_id, ticket_id=ticket_id)
+
+        prompt = f"""基于以下需求分析结果，按要求输出 JSON 格式的 PRD：
+
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+
+请严格按照以下系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{PRODUCT_MANAGER_PROMPT}"""
+
+        try:
+            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            content = result["output"]
+            if "</think>" in content:
+                content = content.split("</think>", 1)[1].strip()
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                return {"status": "failed", "error": "PRD 响应格式无效"}
+            data = _parse_json_safe(content)
+            if data is None:
+                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
+            return {"status": "completed", "data": data}
+        except json.JSONDecodeError as exc:
+            logger.error("LG PRD JSON 解析失败: %s", exc)
+            return {"status": "failed", "error": f"PRD 格式错误: {str(exc)}"}
+        except Exception as exc:
+            logger.error("LG PRD 设计失败: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            clear_context()
+
+    async def _estimate_cost_lg(self, user_id: str, prd: dict, analysis: dict, ticket_id: str | None = None) -> dict:
+        """成本估算（LangGraph Agent 版本）"""
+        agent = create_lg_agent(user_id=user_id, ticket_id=ticket_id)
+
+        combined = {**prd, **analysis}
+        prompt = f"""基于以下 PRD 和需求分析，按要求输出 JSON 格式的成本估算：
+
+{json.dumps(combined, ensure_ascii=False, indent=2)}
+
+请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{COST_ESTIMATOR_PROMPT}"""
+
+        try:
+            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            content = result["output"]
+            if "</think>" in content:
+                content = content.split("</think>", 1)[1].strip()
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                return {"status": "failed", "error": "成本估算响应格式无效"}
+            data = _parse_json_safe(content)
+            if data is None:
+                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
+            return {"status": "completed", "data": data}
+        except json.JSONDecodeError as exc:
+            logger.error("LG 成本估算 JSON 解析失败: %s", exc)
+            return {"status": "failed", "error": f"成本估算格式错误: {str(exc)}"}
+        except Exception as exc:
+            logger.error("LG 成本估算失败: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            clear_context()
+
+    async def _develop_project_lg(self, user_id: str, project_data: dict, ticket_id: str | None = None) -> dict:
+        """项目开发（LangGraph Agent 版本）"""
+        agent = create_lg_agent(user_id=user_id, ticket_id=ticket_id, max_iterations=80)
+
+        prompt = f"""基于以下项目数据，按要求输出 JSON 格式的开发结果：
+
+{json.dumps(project_data, ensure_ascii=False, indent=2)}
+
+请严格按照系统提示词的要求输出 JSON 格式，不要其他内容。
+
+系统提示词：
+{self.DEVELOPER_PROMPT}"""
+
+        try:
+            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            content = result["output"]
+
+            # 检测 Agent 迭代耗尽
+            if "max iterations" in content.lower() or "Agent stopped" in content:
+                logger.error("LG Agent 迭代次数耗尽，原始输出: %s", content[:200])
+                return {"status": "failed", "error": "Agent 迭代次数耗尽，项目过于复杂未能完成。可重试或简化需求。"}
+            if "```" in content:
+                content = content.split("```", 1)[1].strip()
+                if content.startswith("json"):
+                    content = content[4:].strip()
+
+            # 提取 JSON 内容
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                content = content[json_start:json_end]
+            else:
+                logger.error("LG 开发响应中未找到 JSON 内容，原始输出: %s", content[:200])
+                return {"status": "failed", "error": "开发响应格式无效"}
+
+            data = _parse_json_safe(content)
+            if data is None:
+                raise json.JSONDecodeError("所有 JSON 修复策略均失败", content, 0)
+
+            # 将 LLM 生成的代码文件写入 data/users/{user_id}/{ticket_id}/成品/
+            files = data.get("files")
+            if files and isinstance(files, list) and ticket_id:
+                output_root = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "成品"
+                saved_count = 0
+                for entry in files:
+                    if not isinstance(entry, dict):
+                        continue
+                    file_path = entry.get("path") or entry.get("file") or entry.get("name")
+                    file_content = entry.get("content") or entry.get("code") or ""
+                    if not file_path or not file_content:
+                        continue
+                    safe_path = _clean_output_path(file_path, user_id, ticket_id)
+                    target = output_root / safe_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(file_content, encoding="utf-8")
+                    saved_count += 1
+                if saved_count > 0:
+                    logger.info("LG 开发成品已保存 %d 个文件到 %s", saved_count, output_root)
+                    data["_output_dir"] = str(output_root)
+                    data["_file_count"] = saved_count
+
+            # 开发完成后清理 _build 临时目录
+            _build_dir = _PROJECT_ROOT / "data" / "users" / user_id / ticket_id / "_build"
+            if ticket_id and _build_dir.exists():
+                import shutil
+                try:
+                    shutil.rmtree(_build_dir)
+                    logger.info("已清理 _build 临时目录: %s", _build_dir)
+                except Exception as e:
+                    logger.warning("清理 _build 目录失败: %s", e)
+
+            return {"status": "completed", "data": data}
+        except json.JSONDecodeError as exc:
+            logger.error("LG 开发 JSON 解析失败: %s\n原始内容(前2000字符): %s", exc, content[:2000])
+            return {"status": "failed", "error": f"开发格式错误: {str(exc)}"}
+        except Exception as exc:
+            logger.error("LG 开发失败: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            clear_context()
 
 

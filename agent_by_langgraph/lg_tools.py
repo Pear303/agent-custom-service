@@ -63,8 +63,7 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
     与原版 `agent.lc_tools.dispatch_subagent` 的区别：
     - 子代理用独立 StateGraph 子图（`create_subagent_graph`），不依赖 AgentExecutor
     - max_turns 在子图 `post_tools` 节点递减，每轮 agent→tools 循环计 1
-    - **不**做连续只读 tool 的并发执行（原 `ParallelAgentExecutor` 的能力）；
-      原因见 `lg_subagent` 模块顶部注释
+    - 只读工具通过 ParallelToolNode 并发执行（与原版 ParallelAgentExecutor 行为一致）
 
     办完只回传最后一条 AIMessage 的文本内容（与原版行为一致）。
 

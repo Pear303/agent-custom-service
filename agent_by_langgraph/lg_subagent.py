@@ -1,12 +1,10 @@
 """子代理子图 —— 将子代理定义为 LangGraph StateGraph 子图。
 
 每个子代理拥有独立的 system prompt、工具白名单和最大轮数限制。
-子图内 ToolNode 默认串行执行；连续只读 tool 的并发执行**不在本实验范围**——
-原版 `ParallelAgentExecutor` 通过 `ThreadPoolExecutor` 实现，但本项目工具依赖
-`ContextVar`（workspace / user_id 等）解析路径与权限，Python 的
-`ThreadPoolExecutor` 不会自动传播 ContextVar，强行并发会让工具读到错误的
-工作目录或身份上下文。恢复并发需重写工具接口为显式参数，超出本次重构范围。
-详见 `dispatch_subagent_lg` 的 fallback 路径。
+
+并发执行：
+  子图使用 ParallelToolNode 替代标准 ToolNode，支持同一帧内多个只读工具
+  并发执行。ContextVar 通过快照-恢复机制在工作线程间传播。
 """
 from __future__ import annotations
 
@@ -15,9 +13,9 @@ from typing import Annotated, Sequence, TypedDict
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
-from langgraph.prebuilt import ToolNode
 
 from agent.subagents.spec import SubagentSpec
+from agent_by_langgraph.lg_parallel_tools import ParallelToolNode
 
 
 class SubagentState(TypedDict):
@@ -87,13 +85,24 @@ def create_subagent_graph(llm, spec: SubagentSpec):
 
     tools = make_subagent_tools(spec.tool_names)
     llm_with_tools = llm.bind_tools(tools)
-    tool_node = ToolNode(tools)
+    tool_node = ParallelToolNode(tools)
 
     def call_subagent(state: SubagentState, config: RunnableConfig) -> dict:
-        msgs = [
-            SystemMessage(content=spec.system_prompt),
-            HumanMessage(content=state["input"]),
-        ]
+        # 首轮：构建 [SystemMessage, HumanMessage(input)] 作为起始
+        # 后续轮次：state["messages"] 已包含前一轮的完整消息序列
+        # （含 SystemMessage），通过 add_messages reducer 自动累积，
+        # 无需重复注入 SystemMessage
+        existing = state.get("messages", [])
+        if not existing:
+            # 首轮：只有 input，无历史
+            msgs = [
+                SystemMessage(content=spec.system_prompt),
+                HumanMessage(content=state["input"]),
+            ]
+        else:
+            # 后续轮次：existing 已含 SystemMessage + HumanMessage + AIMessage + ToolMessage
+            # 直接使用，不重复注入 SystemMessage
+            msgs = list(existing)
         response = llm_with_tools.invoke(msgs, config=config)
         return {"messages": [response]}
 

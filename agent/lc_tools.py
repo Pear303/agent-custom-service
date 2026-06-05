@@ -296,9 +296,10 @@ class _TextExtractor(HTMLParser):
 
 def _display_path(target: Path, root: Path) -> str:
     """显示相对路径：优先相对于工作区"""
-    if _workspace:
+    ws = _ctx_workspace.get()
+    if ws:
         try:
-            return target.relative_to(_workspace).as_posix()
+            return target.relative_to(ws).as_posix()
         except ValueError:
             pass
     return target.relative_to(root).as_posix()

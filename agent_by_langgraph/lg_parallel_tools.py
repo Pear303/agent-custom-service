@@ -27,15 +27,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import ToolNode
 
-from agent.lc_tools import (
-    _ctx_workspace,
-    _ctx_skills_loader,
-    _ctx_todo_store,
-    _ctx_subagent_registry,
-    _ctx_llm_ref,
-    _ctx_user_id,
-    _ctx_ticket_id,
-)
+from agent_by_langgraph.context_var_manager import snapshot as _snapshot_context_vars, restore as _restore_context_vars
 
 # 只读工具集合，可安全并发
 _READ_ONLY_TOOLS = frozenset({
@@ -47,28 +39,6 @@ _READ_ONLY_TOOLS = frozenset({
 })
 
 
-def _snapshot_context_vars() -> dict:
-    """捕获当前线程的所有 ContextVar 值快照。"""
-    return {
-        "workspace": _ctx_workspace.get(),
-        "skills_loader": _ctx_skills_loader.get(),
-        "todo_store": _ctx_todo_store.get(),
-        "subagent_registry": _ctx_subagent_registry.get(),
-        "llm_ref": _ctx_llm_ref.get(),
-        "user_id": _ctx_user_id.get(),
-        "ticket_id": _ctx_ticket_id.get(),
-    }
-
-
-def _restore_context_vars(snapshot: dict) -> None:
-    """在工作线程内恢复 ContextVar 值。"""
-    _ctx_workspace.set(snapshot["workspace"])
-    _ctx_skills_loader.set(snapshot["skills_loader"])
-    _ctx_todo_store.set(snapshot["todo_store"])
-    _ctx_subagent_registry.set(snapshot["subagent_registry"])
-    _ctx_llm_ref.set(snapshot["llm_ref"])
-    _ctx_user_id.set(snapshot["user_id"])
-    _ctx_ticket_id.set(snapshot["ticket_id"])
 
 
 class ParallelToolNode:
@@ -236,11 +206,13 @@ class ParallelToolNode:
                 names = ", ".join(tc["name"] for tc in read_only_calls)
                 print(f"\n[并发执行 {len(read_only_calls)} 个只读工具]: {names}\n")
 
-            ctx_snapshot = _snapshot_context_vars()
+            # 使用 contextvars.copy_context() 捕获当前上下文，
+            # 比手动快照/恢复更可靠，是 Python 官方推荐的线程间 ContextVar 传播方式
+            import contextvars
+            parent_ctx = contextvars.copy_context()
 
             def _run_single(tc: dict) -> ToolMessage:
-                """在当前线程执行单个工具调用（ContextVar 已恢复）。"""
-                _restore_context_vars(ctx_snapshot)
+                """在父上下文中执行单个工具调用（ContextVar 自动继承）。"""
                 tool = self._name_to_tool.get(tc["name"])
                 if tool is None:
                     return ToolMessage(
@@ -250,7 +222,8 @@ class ParallelToolNode:
                         status="error",
                     )
                 try:
-                    observation = tool.invoke(tc["args"])
+                    # 在父上下文中执行，ContextVar 自动可见
+                    observation = parent_ctx.run(tool.invoke, tc["args"])
                     return ToolMessage(
                         content=str(observation),
                         tool_call_id=tc["id"],

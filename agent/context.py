@@ -5,8 +5,12 @@
 - Agent 身份模板
 - 长期记忆
 - 技能列表和摘要
+- 运行环境信息（操作系统、Shell 类型）
 """
 from __future__ import annotations
+
+import platform
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,6 +20,29 @@ from .skills import SkillsLoader
 
 if TYPE_CHECKING:
     from .memory import MemoryStore
+
+
+def _get_os_info() -> str:
+    """获取当前操作系统和 Shell 信息，供 system prompt 使用。
+
+    让 agent 知道运行环境，避免在 Windows 上使用 Unix 命令。
+    """
+    os_name = platform.system()
+    if os_name == "Windows":
+        shell_info = "PowerShell"
+        return (
+            f"当前运行环境: Windows (PowerShell)\n"
+            f"- 使用 PowerShell 语法执行命令（如 Get-ChildItem 而非 ls，Select-String 而非 grep）\n"
+            f"- 路径使用反斜杠 \\ 或正斜杠 /\n"
+            f"- 不要使用 Unix 命令如 find、cat、grep、ls、pwd 等\n"
+            f"- 使用 dir 代替 ls，type 代替 cat，findstr 代替 grep"
+        )
+    elif os_name == "Darwin":
+        return f"当前运行环境: macOS (Unix shell)"
+    elif os_name == "Linux":
+        return f"当前运行环境: Linux (Unix shell)"
+    else:
+        return f"当前运行环境: {os_name}"
 
 
 class ContextBuilder:
@@ -99,6 +126,11 @@ class ContextBuilder:
         identity = self.render_template("identity.md", workspace=str(self.docs_dir.parent))
         if identity:
             parts.append(identity)
+
+        # 2.5 注入运行环境信息（操作系统、Shell 类型）
+        os_info = _get_os_info()
+        if os_info:
+            parts.append(f"# Runtime Environment\n\n{os_info}")
 
         # 3. 附加长期记忆内容（如果已配置 memory）
         if self.memory:

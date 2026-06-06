@@ -238,6 +238,8 @@ class SubagentRegistry:
                     )
 
             # 创建并存储子代理规格
+            # 追加结论格式要求，便于主代理压缩子代理结果
+            system_prompt += self._CONCLUSION_SUFFIX
             self._specs[agent_name] = SubagentSpec(
                 name=agent_name,
                 description=cfg["description"],
@@ -245,6 +247,14 @@ class SubagentRegistry:
                 tool_names=tuple(cfg["tool_names"]),
                 max_turns=cfg["max_turns"],
             )
+
+    # 子代理结论格式后缀：要求子代理在回复末尾包含结构化结论，
+    # 便于主代理的 _compress_subagent_result 提取
+    _CONCLUSION_SUFFIX = (
+        "\n\n## 输出要求\n\n"
+        "任务完成后，在回复末尾必须包含 `## 结论` 标题，"
+        "简要总结你的发现和操作（包括涉及的文件路径和行号）。"
+    )
 
     def _build_relevant_skills_summary(self, agent_name: str) -> str:
         """基于 _SKILL_AGENT_MAP 构建该子代理相关的技能摘要。

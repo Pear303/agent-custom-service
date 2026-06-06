@@ -67,7 +67,7 @@ def _route_after_tools(state: SubagentState) -> str:
     return "agent"
 
 
-def create_subagent_graph(llm, spec: SubagentSpec):
+def create_subagent_graph(llm, spec: SubagentSpec, checkpointer=None):
     """创建子代理子图。
 
     图结构：
@@ -80,6 +80,7 @@ def create_subagent_graph(llm, spec: SubagentSpec):
     Args:
         llm: DeepSeekChatOpenAI 实例
         spec: SubagentSpec 子代理规格
+        checkpointer: 可选的 LangGraph Checkpointer，启用后子代理支持状态持久化
 
     Returns:
         CompiledGraph: 子图，调用方应传入
@@ -125,7 +126,7 @@ def create_subagent_graph(llm, spec: SubagentSpec):
         {"agent": "agent", END: END},
     )
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # 按 (model_name, agent_type) 区分的子图缓存
@@ -134,16 +135,21 @@ def create_subagent_graph(llm, spec: SubagentSpec):
 _subgraph_cache: dict[tuple[str, str], object] = {}
 
 
-def get_subagent_graph(llm, registry, agent_type: str):
+def get_subagent_graph(llm, registry, agent_type: str, checkpointer=None):
     """获取或创建缓存的子代理子图。
 
     缓存 key: (model_name, agent_type) —— 相同模型 + 相同子代理类型复用子图，
     不同模型则创建新子图（因为工具绑定与 LLM 实例相关）。
 
+    注意：checkpointer 只在首次创建时传入，缓存命中时忽略。
+    这意味着所有同类型子代理共享同一个 checkpointer 实例，
+    通过 thread_id 隔离不同 worker 的状态。
+
     Args:
         llm: ChatModel 实例
         registry: SubagentRegistry
         agent_type: 子代理名称
+        checkpointer: 可选的 LangGraph Checkpointer
 
     Returns:
         CompiledGraph
@@ -160,7 +166,7 @@ def get_subagent_graph(llm, registry, agent_type: str):
             raise ValueError(
                 f"Unknown subagent '{agent_type}'. Available: {available}"
             )
-        _subgraph_cache[key] = create_subagent_graph(llm, spec)
+        _subgraph_cache[key] = create_subagent_graph(llm, spec, checkpointer=checkpointer)
     return _subgraph_cache[key]
 
 

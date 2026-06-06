@@ -259,13 +259,13 @@ def _invoke_with_retry(executor, input_data, max_retries: int = _MAX_RETRIES):
     raise last_exc
 
 
-def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
-    """在线程中调用 LangGraph Agent。
+async def _invoke_lg_async(agent, prompt: str, output_subdir=None):
+    """异步调用 LangGraph Agent（原生 async，无需 asyncio.run 嵌套）。
 
-    与 _invoke_in_thread 类似，但使用 LangGraph StateGraph 替代 AgentExecutor。
-    由于 asyncio.to_thread 不会自动传播 ContextVar，需要在新线程中显式恢复。
+    替代旧的 _invoke_lg_in_thread（通过 asyncio.to_thread + asyncio.run 调用），
+    直接在当前事件循环中 await agent.graph.ainvoke，消除线程切换开销。
 
-    节点函数已改为 async def，因此使用 asyncio.run(ainvoke) 替代同步 invoke。
+    ContextVar 在 async 上下文中自动传播，无需手动快照/恢复。
 
     Checkpointer 利用策略：
     - 首轮（agent._first_turn=True）：传入完整上下文 [SystemMessage, ...chat_history, HumanMessage]
@@ -282,22 +282,8 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     Returns:
         dict: {"output": 回复文本} 或 {"output": ..., "interrupt": ...}（需要审批时）
     """
-    import asyncio
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
     from agent_by_langgraph.lg_agent import ReasoningCollector
-    from agent.lc_tools import (
-        _ctx_workspace, _ctx_skills_loader, _ctx_todo_store,
-        _ctx_subagent_registry, _ctx_llm_ref, _ctx_user_id, _ctx_ticket_id,
-    )
-
-    # 在新线程中恢复 ContextVar（asyncio.to_thread 不自动传播）
-    _ctx_workspace.set(agent._ctx_snapshot.get("workspace"))
-    _ctx_skills_loader.set(agent._ctx_snapshot.get("skills_loader"))
-    _ctx_todo_store.set(agent._ctx_snapshot.get("todo_store"))
-    _ctx_subagent_registry.set(agent._ctx_snapshot.get("subagent_registry"))
-    _ctx_llm_ref.set(agent._ctx_snapshot.get("llm_ref"))
-    _ctx_user_id.set(agent._ctx_snapshot.get("user_id"))
-    _ctx_ticket_id.set(agent._ctx_snapshot.get("ticket_id"))
 
     logger.debug(
         "[LangGraph 执行] user_id=%s, first_turn=%s, checkpointer=%s",
@@ -305,7 +291,7 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     )
 
     has_checkpointer = agent.graph.checkpointer is not None
-    with agent._turn_lock:
+    async with agent._async_invoke_lock:
         is_first_turn = agent._first_turn
         if is_first_turn and has_checkpointer:
             agent._first_turn = False
@@ -337,13 +323,20 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     config = {
         "callbacks": all_callbacks,
         "recursion_limit": agent.max_iterations * 2 + 5,
-        "configurable": {"thread_id": agent.user_id or "default"},
+        "configurable": {
+            "thread_id": agent.user_id or "default",
+            "__has_checkpointer__": getattr(agent.graph, '_lg_has_checkpointer', agent.graph.checkpointer is not None),
+        },
     }
     try:
-        # 节点函数为 async def，使用 asyncio.run(ainvoke)
-        result = asyncio.run(agent.graph.ainvoke(input_state, config=config))
-    finally:
+        # 原生 async 调用，无需 asyncio.run 嵌套
+        # _async_invoke_lock 保护防止同一 user_id 的并发请求导致 checkpointer 状态混乱
+        async with agent._async_invoke_lock:
+            result = await agent.graph.ainvoke(input_state, config=config)
+    except Exception:
+        # 仅在异常时清理上下文，正常流程由调用方在 finally 中清理
         clear_context()
+        raise
 
     # 检查是否有中断（interrupt_approval 节点暂停）
     # __interrupt__ 是 LangGraph 在 interrupt() 后自动添加到结果中的字段
@@ -391,7 +384,7 @@ def _invoke_lg_in_thread(agent, prompt: str, output_subdir=None):
     return {"output": reply}
 
 
-def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
+async def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
     """恢复被 interrupt() 暂停的 LangGraph Agent 执行。
 
     当 interrupt_approval 节点暂停执行后，调用方通过此函数恢复：
@@ -406,7 +399,6 @@ def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
     Returns:
         dict: {"output": 回复文本}
     """
-    import asyncio
     from langgraph.types import Command
 
     config = {
@@ -414,23 +406,10 @@ def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
         "configurable": {"thread_id": thread_id},
     }
 
-    # 恢复 ContextVar
-    from agent.lc_tools import (
-        _ctx_workspace, _ctx_skills_loader, _ctx_todo_store,
-        _ctx_subagent_registry, _ctx_llm_ref, _ctx_user_id, _ctx_ticket_id,
-    )
-    _ctx_workspace.set(agent._ctx_snapshot.get("workspace"))
-    _ctx_skills_loader.set(agent._ctx_snapshot.get("skills_loader"))
-    _ctx_todo_store.set(agent._ctx_snapshot.get("todo_store"))
-    _ctx_subagent_registry.set(agent._ctx_snapshot.get("subagent_registry"))
-    _ctx_llm_ref.set(agent._ctx_snapshot.get("llm_ref"))
-    _ctx_user_id.set(agent._ctx_snapshot.get("user_id"))
-    _ctx_ticket_id.set(agent._ctx_snapshot.get("ticket_id"))
+    # async 上下文中 ContextVar 自动传播，无需手动恢复
 
     try:
-        result = asyncio.run(
-            agent.graph.ainvoke(Command(resume=decision), config=config)
-        )
+        result = await agent.graph.ainvoke(Command(resume=decision), config=config)
     finally:
         clear_context()
 
@@ -887,7 +866,7 @@ class AgentService:
 {REQUIREMENT_ANALYST_PROMPT}"""
 
         try:
-            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
             if "</think>" in content:
                 content = content.split("</think>", 1)[1].strip()
@@ -924,7 +903,7 @@ class AgentService:
 {PRODUCT_MANAGER_PROMPT}"""
 
         try:
-            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
             if "</think>" in content:
                 content = content.split("</think>", 1)[1].strip()
@@ -962,7 +941,7 @@ class AgentService:
 {COST_ESTIMATOR_PROMPT}"""
 
         try:
-            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
             if "</think>" in content:
                 content = content.split("</think>", 1)[1].strip()
@@ -999,7 +978,7 @@ class AgentService:
 {self.DEVELOPER_PROMPT}"""
 
         try:
-            result = await asyncio.to_thread(_invoke_lg_in_thread, agent, prompt)
+            result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
 
             # 检测 Agent 迭代耗尽

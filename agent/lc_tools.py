@@ -413,7 +413,9 @@ def write_file(path: str, content: str) -> str:
         fp = _resolve(path)
         fp.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
         fp.write_text(content, encoding="utf-8")
-        return f"Successfully wrote {len(content)} characters to {fp}"
+        # 返回 workspace 相对路径，让 agent 知道文件实际位置
+        display = _display_path(fp, Path(__file__).parent.parent)
+        return f"Successfully wrote {len(content)} characters to {display}"
     except PermissionError as e:
         return f"Error: {e}"
     except Exception as e:
@@ -439,7 +441,7 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
             if old_text == "":
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_text(new_text, encoding="utf-8")
-                return f"Successfully created {fp}"
+                return f"Successfully created {_display_path(fp, Path(__file__).parent.parent)}"
             return f"Error: File not found: {path}"
         raw = fp.read_bytes()
         uses_crlf = b"\r\n" in raw  # 检测换行符风格
@@ -449,7 +451,7 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
             if content.strip():
                 return f"Error: Cannot create file — {path} already exists and is not empty."
             fp.write_text(new_text, encoding="utf-8")
-            return f"Successfully edited {fp}"
+            return f"Successfully edited {_display_path(fp, Path(__file__).parent.parent)}"
         matches = _find_matches(content, norm_old)  # 查找匹配位置
         if not matches:
             # 未找到匹配，返回最相似位置的差异对比
@@ -481,7 +483,7 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
         if uses_crlf:
             new_content = new_content.replace("\n", "\r\n")  # 恢复原始换行符风格
         fp.write_bytes(new_content.encode("utf-8"))
-        return f"Successfully edited {fp}"
+        return f"Successfully edited {_display_path(fp, Path(__file__).parent.parent)}"
     except PermissionError as e:
         return f"Error: {e}"
     except Exception as e:
@@ -604,7 +606,7 @@ def _paginate(items: list, limit: int | None, offset: int) -> tuple[list, bool]:
 def glob_tool(
     pattern: str,
     path: str = ".",
-    head_limit: Optional[int] = 250,
+    head_limit: Optional[int] = 200,
     offset: int = 0,
     entry_type: str = "files",
 ) -> str:
@@ -658,8 +660,8 @@ def glob_tool(
 #  grep
 # ═══════════════════════════════════════════════════════════════════
 
-_DEFAULT_HEAD_LIMIT = 250
-_MAX_RESULT_CHARS = 128_000
+_DEFAULT_HEAD_LIMIT = 100
+_MAX_RESULT_CHARS = 16_000
 _MAX_FILE_BYTES = 2_000_000
 
 
@@ -674,7 +676,7 @@ def grep_tool(
     output_mode: str = "files_with_matches",
     context_before: int = 0,
     context_after: int = 0,
-    head_limit: Optional[int] = 250,
+    head_limit: Optional[int] = 100,
     offset: int = 0,
 ) -> str:
     """搜索文件内容。output_mode: content/files_with_matches/count。跳过二进制和大文件（>2MB）。

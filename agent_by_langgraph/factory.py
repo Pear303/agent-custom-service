@@ -38,6 +38,7 @@ def _get_llm(model: str = None):
             api_key=os.environ["DEEPSEEK_API_KEY"],
             base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             streaming=True,
+            max_tokens=int(os.environ.get("DEEPSEEK_MAX_TOKENS", "16384")),
         )
     return _llm_cache[model]
 
@@ -81,7 +82,7 @@ def create_lg_agent(
 
     同一 user_id 复用实例，使 Checkpointer 增量更新生效：
     - 首次调用：创建新实例，_first_turn=True
-    - 后续调用：返回缓存实例，_first_turn=False（由 _invoke_lg_in_thread 管理）
+    - 后续调用：返回缓存实例，_first_turn=False（由 _invoke_lg_async 管理）
 
     共享 LLM / SkillsLoader / SubagentRegistry 实例，只隔离 MemoryStore / TodoStore / Checkpointer。
     """
@@ -90,9 +91,9 @@ def create_lg_agent(
 
     cache_key = f"{user_id}:{ticket_id or ''}"
 
+    # 第一次检查（快速路径，无锁）
     with _cache_lock:
         if cache_key in _agent_cache:
-            # 缓存命中：移动到末尾（LRU）
             _agent_cache.move_to_end(cache_key)
             agent = _agent_cache[cache_key]
             logger.info(
@@ -101,11 +102,10 @@ def create_lg_agent(
             )
             return agent
 
-    # 缓存未命中：创建新实例
-    with _cache_lock:
-        llm = _get_llm(model)
-        skills = _get_skills_loader()
-        sub_reg = _get_subagent_registry()
+    # 缓存未命中：在锁外创建新实例（耗时操作，避免长时间持锁）
+    llm = _get_llm(model)
+    skills = _get_skills_loader()
+    sub_reg = _get_subagent_registry()
 
     agent = LangGraphAgent(
         user_id=user_id,
@@ -117,7 +117,15 @@ def create_lg_agent(
         sub_reg=sub_reg,
     )
 
+    # Double-check：在锁内再次检查，防止并发创建同一 user_id 的实例
     with _cache_lock:
+        if cache_key in _agent_cache:
+            # 另一个线程已创建，丢弃本实例，返回已有的
+            agent.close()
+            _agent_cache.move_to_end(cache_key)
+            logger.info("[Factory] Agent 并发创建冲突，复用已有实例: user_id=%s", user_id)
+            return _agent_cache[cache_key]
+
         _agent_cache[cache_key] = agent
         _agent_cache.move_to_end(cache_key)
         # LRU 淘汰
@@ -126,9 +134,13 @@ def create_lg_agent(
             evicted.close()  # 释放 Checkpointer SQLite 连接
             logger.info("[Factory] Agent 缓存淘汰: %s", evicted_key)
 
+    # 区分"无 checkpointer"和"延迟初始化待完成"
+    cp_status = "lazy" if agent.graph.checkpointer is None and hasattr(agent, '_ensure_checkpointer') else (
+        "ready" if agent.graph.checkpointer is not None else "none"
+    )
     logger.info(
         "[Factory] Agent 新建: user_id=%s, checkpointer=%s, 缓存大小=%d",
-        user_id, agent.graph.checkpointer is not None, len(_agent_cache),
+        user_id, cp_status, len(_agent_cache),
     )
     return agent
 

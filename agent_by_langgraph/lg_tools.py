@@ -83,6 +83,13 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
     # 此函数体不会被调用——route_after_agent 拦截 dispatch_subagent_lg
     # 的 tool_calls，不走 tools 节点，走 subagent_dispatcher。
     # 但作为 fallback（如直接 invoke 工具时），保留同步执行逻辑。
+    import warnings
+    warnings.warn(
+        "dispatch_subagent_lg 走了 fallback 路径（同步执行），"
+        "预期应由 route_after_agent 路由到 subagent_dispatcher 并行执行。"
+        "请检查路由逻辑是否正常。",
+        stacklevel=2,
+    )
     from agent.lc_tools import _ctx_llm_ref, _ctx_subagent_registry
     from agent_by_langgraph.lg_subagent import get_subagent_graph
 
@@ -107,7 +114,7 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
             "turns_remaining": spec.max_turns,
             "max_turns": spec.max_turns,
             "messages": [],
-        })
+        })  # fallback 路径无 checkpointer，不传 config
     except Exception as exc:
         return f"Error: subagent '{agent_type}' raised: {exc}"
 

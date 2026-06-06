@@ -36,6 +36,13 @@ def _clean_output_path(file_path: str, user_id: str, ticket_id: str) -> Path:
     """
     p = Path(file_path)
 
+    # 过滤 LLM 误将命令行参数当路径的垃圾路径（如 "-p"、"--force"）
+    _GARBAGE_PREFIXES = ("-",)
+    stripped_str = str(p).lstrip("/\\")
+    if any(stripped_str.startswith(prefix) for prefix in _GARBAGE_PREFIXES):
+        logger.warning("路径 '%s' 以垃圾前缀开头，跳过", file_path)
+        return None
+
     if p.is_absolute():
         try:
             p = p.relative_to(_PROJECT_ROOT)

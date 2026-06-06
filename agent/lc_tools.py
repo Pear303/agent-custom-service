@@ -99,6 +99,7 @@ def _resolve(path: str) -> Path:
     - 相对路径：src/app.js → workspace/src/app.js
     - 绝对路径：f:/XiangMu/.../projects/myapp/app.js → 先剥离项目根，再拼到 workspace
     - 带项目目录的路径：projects/myapp/app.js → 拼到 workspace/projects/myapp/app.js
+    - 带完整 data/users 前缀的路径：data/users/uid/tid/成品/src/app.js → 剥离前缀后 src/app.js
     
     关键约束：最终路径必须严格在 workspace 目录内。
     """
@@ -112,6 +113,29 @@ def _resolve(path: str) -> Path:
                 p = p.relative_to(_project_root)
             except ValueError:
                 p = Path(p.name)
+
+        # 剥离 workspace 自身路径前缀，防止路径嵌套
+        # LLM 可能返回包含完整 data/users/uid/tid/... 的路径，
+        # 拼接到 workspace 后会导致 .../tid/data/users/uid/tid/... 的嵌套
+        if not p.is_absolute():
+            _ws_prefixes = [
+                Path("data") / "users" / _ctx_user_id.get() / _ctx_ticket_id.get() / "成品",
+                Path("data") / "users" / _ctx_user_id.get() / _ctx_ticket_id.get() / "_build",
+                Path("data") / "users" / _ctx_user_id.get() / _ctx_ticket_id.get(),
+                Path("data") / "users" / _ctx_user_id.get(),
+                Path("data") / "users",
+                Path("data"),
+            ]
+            for prefix in _ws_prefixes:
+                if not prefix.parts or prefix == Path("."):
+                    continue
+                try:
+                    stripped = p.relative_to(prefix)
+                    if stripped != p:
+                        p = stripped
+                        break
+                except ValueError:
+                    continue
 
         resolved = (workspace / p).resolve()
 

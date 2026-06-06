@@ -277,11 +277,36 @@ async def _invoke_lg_async(agent, prompt: str, output_subdir=None):
     Args:
         agent: LangGraphAgent 实例
         prompt: 用户输入
-        output_subdir: 未使用（保持接口兼容）
+        output_subdir: 非空时使用 _build 临时目录作为 workspace，
+                       避免 LLM 的 write_file 与最终输出目录冲突导致路径嵌套。
 
     Returns:
         dict: {"output": 回复文本} 或 {"output": ..., "interrupt": ...}（需要审批时）
     """
+    from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+    from agent_by_langgraph.lg_agent import ReasoningCollector
+
+    # 如果指定了 output_subdir，将 workspace 切换到 _build 临时目录
+    # 避免 LLM 的 write_file 直接操作在 ticket 目录下导致路径嵌套
+    original_workspace = None
+    if output_subdir:
+        original_workspace = _ctx_workspace.get()
+        build_ws = original_workspace / "_build" if original_workspace else None
+        if build_ws:
+            build_ws.mkdir(parents=True, exist_ok=True)
+            set_workspace(build_ws)
+            logger.info("[LG Invoke] 使用 _build 隔离目录: %s", build_ws)
+
+    try:
+        return await _invoke_lg_async_inner(agent, prompt)
+    finally:
+        # 恢复原始 workspace
+        if original_workspace is not None:
+            set_workspace(original_workspace)
+
+
+async def _invoke_lg_async_inner(agent, prompt: str):
+    """_invoke_lg_async 的核心逻辑（workspace 已切换后执行）。"""
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
     from agent_by_langgraph.lg_agent import ReasoningCollector
 
@@ -821,6 +846,8 @@ class AgentService:
                         if not file_path or not file_content:
                             continue
                         safe_path = _clean_output_path(file_path, user_id, ticket_id)
+                        if safe_path is None:
+                            continue
                         target = output_root / safe_path
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(file_content, encoding="utf-8")
@@ -978,7 +1005,7 @@ class AgentService:
 {self.DEVELOPER_PROMPT}"""
 
         try:
-            result = await _invoke_lg_async(agent, prompt)
+            result = await _invoke_lg_async(agent, prompt, output_subdir="成品")
             content = result["output"]
 
             # 检测 Agent 迭代耗尽
@@ -1016,6 +1043,8 @@ class AgentService:
                     if not file_path or not file_content:
                         continue
                     safe_path = _clean_output_path(file_path, user_id, ticket_id)
+                    if safe_path is None:
+                        continue
                     target = output_root / safe_path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(file_content, encoding="utf-8")

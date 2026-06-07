@@ -268,11 +268,14 @@ async def _call_lg_agent_with_events(prompt: str, user_id: str, ticket_id: str,
     from langchain_core.runnables import RunnableConfig
     from langgraph.types import Command
 
-    phase_ticket = f"{ticket_id}_{phase_name}" if phase_name else ticket_id
-
+    # D2-fix: 不再拼接 phase_name 到 ticket_id。
+    # 之前 phase_ticket = f"{ticket_id}_{phase_name}" 导致 Agent 工作区为
+    # bugfix_task_001_bugfix，而验证脚本检查 bugfix_task_001，路径不一致。
+    # 现在直接使用原始 ticket_id，确保 Agent 和验证脚本使用同一工作区。
+    # thread_id 仍通过 config.configurable 独立区分阶段。
     agent = create_lg_agent(
         user_id=user_id,
-        ticket_id=phase_ticket,
+        ticket_id=ticket_id,
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         max_iterations=max_iterations,
     )
@@ -387,7 +390,7 @@ async def _call_lg_agent_with_events(prompt: str, user_id: str, ticket_id: str,
             result.add_error(f"Agent 执行异常: {exc}")
             traceback.print_exc()
             try:
-                reset_lg_agent(user_id, phase_ticket)
+                reset_lg_agent(user_id, ticket_id)
             except Exception:
                 pass
             return {"output": f"ERROR: {exc}", "final_phase": "error", "stall_count": 0}
@@ -434,7 +437,7 @@ async def _call_lg_agent_with_events(prompt: str, user_id: str, ticket_id: str,
 
     # 清理
     try:
-        reset_lg_agent(user_id, phase_ticket)
+        reset_lg_agent(user_id, ticket_id)
     except Exception:
         pass
 
@@ -912,6 +915,9 @@ async def run_test():
     result = TestResult()
     from dotenv import load_dotenv
     load_dotenv()
+
+    # 测试环境允许无 checkpointer 时自动放行危险工具
+    os.environ.setdefault("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true")
 
     # 检查 API Key
     if not os.environ.get("DEEPSEEK_API_KEY") or \

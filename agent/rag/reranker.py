@@ -38,7 +38,10 @@ def _get_reranker() -> HuggingFaceCrossEncoder:
             return _reranker_instance
 
         import os
+<<<<<<< HEAD
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+=======
+>>>>>>> c1e792833186c2c49cf03c20ef68dd342cd85562
         os.environ.setdefault("HF_HOME", str(_MODELS_DIR))
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_MODELS_DIR))
 

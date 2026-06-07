@@ -1,6 +1,6 @@
 # OPC Smart Customer Service System
 
-基于 LangChain 的多轮对话 AI 服务系统。异步任务队列处理多会话并发、API 层与 Agent 核心分离解耦、前后端分离架构，前端采用 Vue 3 + TypeScript 支持流式对话展示。提供 CLI 与 REST API 双入口，可作为远程服务独立部署。
+LangChain/LangGraph 双引擎 AI Agent 服务。FastAPI + SSE 流式，三层记忆自动压缩，11 种子代理派遣，可插拔技能包，Vue 3 前端。CLI 与 REST API 双入口。
 
 ## 核心特性
 

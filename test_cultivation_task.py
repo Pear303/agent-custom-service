@@ -192,6 +192,15 @@ async def run_test():
     from dotenv import load_dotenv
     load_dotenv()
 
+    # 清理残留数据，确保干净启动
+    test_user_id = "test_cultivation_user"
+    test_ticket_id = "cultivation_task_001"
+    data_dir = Path(__file__).parent / "data" / "users" / test_user_id
+    if data_dir.exists():
+        import shutil
+        logger.info(f"清理残留数据: {data_dir}")
+        shutil.rmtree(data_dir, ignore_errors=True)
+
     # 检查 API Key
     if not os.environ.get("DEEPSEEK_API_KEY") or os.environ["DEEPSEEK_API_KEY"] == "your_api_key_here":
         logger.error("DEEPSEEK_API_KEY 未配置！请在 .env 文件中设置。")
@@ -202,9 +211,6 @@ async def run_test():
 
     # 创建 Agent（使用工厂模式，模拟生产环境）
     from agent_by_langgraph.factory import create_lg_agent
-
-    test_user_id = "test_cultivation_user"
-    test_ticket_id = "cultivation_task_001"
 
     observer.record_event("AGENT_CREATE", f"user_id={test_user_id}, ticket_id={test_ticket_id}")
 
@@ -272,7 +278,6 @@ async def run_test():
     for retry in range(max_retries):
         try:
             # 使用 astream_events 获取节点级事件流
-            result_state = None
             async for event in agent.graph.astream_events(
                 input_state, config=config, version="v2"
             ):
@@ -300,17 +305,14 @@ async def run_test():
                                 observer.record_phase(last_phase, new_phase)
 
             # astream_events 完成后获取最终 state
-            result = result_state
-            # 如果没有从事件流中收集到 state，用 ainvoke 的等价方式获取
-            if result is None:
-                # astream_events 不直接返回最终 state，需要通过 get_state 获取
-                if has_checkpointer:
-                    snapshot = await agent.graph.aget_state(config)
-                    result = {"messages": snapshot.values.get("messages", [])}
-                else:
-                    # 无 checkpointer 时，astream_events 的最后一个 on_chain_end 包含最终输出
-                    # 此处用 ainvoke 作为降级
-                    result = await agent.graph.ainvoke(input_state, config=config)
+            # astream_events 不直接返回最终 state，需要通过 get_state 获取
+            if has_checkpointer:
+                snapshot = await agent.graph.aget_state(config)
+                result = {"messages": snapshot.values.get("messages", [])}
+            else:
+                # 无 checkpointer 时，astream_events 的最后一个 on_chain_end 包含最终输出
+                # 此处用 ainvoke 作为降级
+                result = await agent.graph.ainvoke(input_state, config=config)
 
         except Exception as exc:
             observer.record_error(f"Agent 执行失败: {exc}")

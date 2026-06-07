@@ -353,11 +353,10 @@ async def _call_lg_agent(prompt: str, user_id: str, ticket_id: str,
     from langchain_core.runnables import RunnableConfig
     from langgraph.types import Command
 
-    phase_ticket = f"{ticket_id}_{phase_name}" if phase_name else ticket_id
-
+    # D2-fix: 不再拼接 phase_name 到 ticket_id，确保 Agent 工作区与验证路径一致
     agent = create_lg_agent(
         user_id=user_id,
-        ticket_id=phase_ticket,
+        ticket_id=ticket_id,
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         max_iterations=max_iterations,
     )
@@ -454,7 +453,7 @@ async def _call_lg_agent(prompt: str, user_id: str, ticket_id: str,
 
     # 清理
     try:
-        reset_lg_agent(user_id, phase_ticket)
+        reset_lg_agent(user_id, ticket_id)
     except Exception:
         pass
 
@@ -627,24 +626,22 @@ async def run_development_phase(project_data: dict) -> dict:
 def verify_product(dev_data: dict) -> None:
     """验证开发产出的文件。"""
     project_root = Path(__file__).parent
-    dev_workspace = project_root / "data" / "users" / TEST_USER_ID / f"{TEST_TICKET_ID}_development"
-    base_workspace = project_root / "data" / "users" / TEST_USER_ID / TEST_TICKET_ID
+    # D2-fix: Agent 和验证脚本现在使用同一 ticket_id，无需搜索两个目录
+    workspace = project_root / "data" / "users" / TEST_USER_ID / TEST_TICKET_ID
 
     # 收集所有已创建的文件
     found_files = []
-    for ws in [dev_workspace, base_workspace]:
-        if ws.exists():
-            for p in ws.rglob("*"):
-                if p.is_file() and p.name != "checkpoints.db" and "checkpoints" not in str(p):
-                    found_files.append(p)
+    if workspace.exists():
+        for p in workspace.rglob("*"):
+            if p.is_file() and p.name != "checkpoints.db" and "checkpoints" not in str(p):
+                found_files.append(p)
 
     # 也扫描成品目录
-    for ws in [dev_workspace, base_workspace]:
-        output_root = ws / "成品"
-        if output_root.exists():
-            for p in output_root.rglob("*"):
-                if p.is_file():
-                    found_files.append(p)
+    output_root = workspace / "成品"
+    if output_root.exists():
+        for p in output_root.rglob("*"):
+            if p.is_file():
+                found_files.append(p)
 
     # 去重
     seen = set()
@@ -1077,6 +1074,9 @@ async def run_test():
     result = TestResult()
     from dotenv import load_dotenv
     load_dotenv()
+
+    # 测试环境允许无 checkpointer 时自动放行危险工具
+    os.environ.setdefault("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true")
 
     # 检查 API Key
     if not os.environ.get("DEEPSEEK_API_KEY") or \

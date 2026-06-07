@@ -80,7 +80,37 @@ _sub_checkpointer_cache: OrderedDict[str, tuple] = OrderedDict()
 _sub_checkpointer_lock = threading.Lock()
 _MAX_SUB_CHECKPOINTER_CACHE_SIZE = 50
 
+# D14: 使用 UUID 哨兵值，避免与子代理输出内容冲突
+import uuid
+_SUBAGENT_CLEAR_SENTINEL = f"__SUBAGENT_CLEAR_{uuid.uuid4().hex}__"
 
+
+
+
+async def _invoke_with_retry(subgraph, sub_input: dict, sub_config: dict, agent_name: str, max_retries: int = 3):
+    """带重试的子图调用，处理 SQLite 'database is locked' 错误。
+
+    高并发场景下多个子代理同时写入同一 SQLite 数据库，
+    即使启用 WAL 模式仍可能短暂锁冲突。重试机制确保瞬态错误不导致任务失败。
+    """
+    import asyncio
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return await subgraph.ainvoke(sub_input, config=sub_config)
+        except Exception as exc:
+            last_exc = exc
+            err_msg = str(exc).lower()
+            if "database is locked" in err_msg or "locked" in err_msg:
+                wait = 0.5 * (2 ** attempt)  # 指数退避: 0.5s, 1s, 2s
+                logger.warning(
+                    "[SubCheckpointer] %s 数据库锁定，第 %d/%d 次重试（等待 %.1fs）",
+                    agent_name, attempt + 1, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise last_exc
 
 
 def _replace_results(existing: list[str], new: list[str]) -> list[str]:
@@ -88,16 +118,15 @@ def _replace_results(existing: list[str], new: list[str]) -> list[str]:
 
     约定：
     - new 非空 → 追加到 existing
-    - new == ["__SUBAGENT_CLEAR__"] → 清空（消费信号，由 aggregate_results 发出）
+    - new == [_SUBAGENT_CLEAR_SENTINEL] → 清空（消费信号，由 aggregate_results 发出）
     - new 为空列表 → 保持不变（LangGraph Send 合并时的默认行为）
 
     替代 operator.add：add reducer 无法清空列表，
     导致 aggregate_results 返回 [] 后 existing 仍保留旧值。
 
-    D10: 使用 "__SUBAGENT_CLEAR__" 替代 "__CLEAR__" 作为哨兵值，
-    降低与普通文本内容冲突的风险。
+    D14: 使用 UUID 哨兵值，避免与子代理输出内容冲突。
     """
-    if new == ["__SUBAGENT_CLEAR__"]:
+    if new == [_SUBAGENT_CLEAR_SENTINEL]:
         return []  # 清空信号：aggregate_results 消费后发出
     return existing + new
 
@@ -148,6 +177,7 @@ class SubagentWorkerState(TypedDict):
     agent_name: str
     task: str
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    _parent_phase: str  # P3: 主图当前阶段，gather 时强制子代理只读
 
 
 def _route_after_agent(state: AgentState) -> str | list[Send]:
@@ -183,6 +213,19 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
     if subagent_calls:
         # 混合调用：非子代理的 tool_calls 由 _advance_phase 暂存到 state._pending_tool_calls，
         # _aggregate_results 从 state 读取并恢复到消息流
+        if normal_calls:
+            logger.info(
+                "[D4] 混合调用: %d 个子代理 + %d 个普通工具, "
+                "非子代理调用将由 _advance_phase 暂存",
+                len(subagent_calls), len(normal_calls),
+            )
+
+        # P3 gather 阶段语义约束：将当前阶段传递给 subagent_worker，
+        # 由 worker 在执行时强制过滤子代理工具为只读（如果处于 gather 阶段）。
+        # 不在此处拒绝派遣，因为条件边函数无法注入拒绝消息到 state，
+        # 拒绝后回到 agent 会导致无限循环。
+        parent_phase = state.get("_phase", "gather") or "gather"
+
         sends = []
         for tc in subagent_calls:
             sends.append(Send(
@@ -191,6 +234,7 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
                     "agent_name": tc["args"]["agent_name"],
                     "task": tc["args"]["task"],
                     "messages": [],
+                    "_parent_phase": parent_phase,
                 },
             ))
         return sends
@@ -249,6 +293,25 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
 
         print(f"\n[LG 并行子代理 · {agent_name}]: {task[:80]}")
 
+        # P3 gather 阶段语义约束：非只读子代理在 gather 阶段不执行
+        # 返回提示消息，让主 agent 知道需要等待 modify 阶段
+        parent_phase = state.get("_parent_phase", "all") or "all"
+        if parent_phase == "gather" and not spec.read_only:
+            logger.warning(
+                "[P3] gather 阶段拒绝非只读子代理 %s（含写工具: %s），"
+                "请等待进入 modify 阶段后再派遣",
+                agent_name,
+                [t for t in spec.tool_names if t in _DANGEROUS_TOOLS],
+            )
+            return {
+                "subagent_results": [
+                    f"[{agent_name}] P3 约束：当前处于 gather（信息收集）阶段，"
+                    f"不允许派遣含写操作工具的子代理。"
+                    f"请先完成信息收集，系统会自动进入 modify 阶段后再执行修改操作。"
+                    f"你可以派遣只读子代理来收集信息。"
+                ]
+            }
+
         # 构造子代理的 checkpointer 和隔离 thread_id
         import time
         user_id = _ctx_user_id.get() or "default"
@@ -280,6 +343,12 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
                     ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
                     # 直接 await：_subagent_worker 是 async 节点，已在事件循环中
                     checkpointer_instance = await ctx.__aenter__()
+                    # 启用 WAL 模式：子代理并行写入时不互相阻塞
+                    try:
+                        await checkpointer_instance.db.execute("PRAGMA journal_mode=WAL")
+                        await checkpointer_instance.db.execute("PRAGMA busy_timeout=5000")
+                    except Exception:
+                        pass
                     _sub_checkpointer_cache[user_id] = (ctx, checkpointer_instance)
                 sub_checkpointer = _sub_checkpointer_cache[user_id][1]
         except Exception as exc:
@@ -302,7 +371,7 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
                     "rag_context": "",
                     "needs_web_fallback": False,
                 })
-            result = await subgraph.ainvoke(sub_input, config=sub_config)
+            result = await _invoke_with_retry(subgraph, sub_input, sub_config, agent_name)
         except Exception as exc:
             return {"subagent_results": [f"[{agent_name}] Error: {exc}"]}
 
@@ -353,29 +422,44 @@ def _aggregate_results(state: AgentState) -> dict:
 
     pending_route = "agent"
     if pending_calls:
+        # 检查 pending_calls 中是否包含危险工具
+        has_dangerous_pending = any(
+            tc.get("name") in _DANGEROUS_TOOLS for tc in pending_calls
+        )
+
         # 注入新 AIMessage 包含未执行的 tool_calls
+        # 添加 id 字段确保消息唯一性，避免 LangGraph 消息去重异常
         pending_msg = AIMessage(
             content="",
             tool_calls=pending_calls,
+            id=f"pending-{uuid.uuid4().hex[:8]}",
         )
         new_messages.append(pending_msg)
-        # 直接路由到 tools 节点执行 pending tool_calls，
-        # 而非回到 agent 让 LLM 重新决策
-        pending_route = "tools"
-        logger.info(
-            "[D4] 混合调用恢复: %d 个 pending tool_calls 将路由到 tools 节点",
-            len(pending_calls),
-        )
+
+        if has_dangerous_pending:
+            # 危险工具必须走 interrupt_approval，不能绕过审批门
+            pending_route = "interrupt_approval"
+            logger.info(
+                "[D4] 混合调用恢复: %d 个 pending tool_calls 含危险工具，路由到 interrupt_approval",
+                len(pending_calls),
+            )
+        else:
+            # 普通工具直接路由到 tools 节点执行
+            pending_route = "tools"
+            logger.info(
+                "[D4] 混合调用恢复: %d 个 pending tool_calls 将路由到 tools 节点",
+                len(pending_calls),
+            )
     elif state.get("_pending_tool_calls"):
         # D4 防御性检查：_pending_tool_calls 存在但为空列表，
         # 不应路由到 tools（可能是上一轮残留的空列表）
         logger.warning("[D4] _pending_tool_calls 为空列表，路由到 agent 而非 tools")
 
-    # 清空 subagent_results（通过哨兵值 "__SUBAGENT_CLEAR__" 触发 _replace_results 清空）
+    # 清空 subagent_results（通过 UUID 哨兵值触发 _replace_results 清空）
     # 同时清空 _pending_tool_calls（已消费）
     result = {
         "messages": new_messages,
-        "subagent_results": ["__SUBAGENT_CLEAR__"],
+        "subagent_results": [_SUBAGENT_CLEAR_SENTINEL],
         "_pending_route": pending_route,
         "_pending_tool_calls": [],  # 始终清空，避免空列表残留导致下一轮误判
     }
@@ -383,7 +467,13 @@ def _aggregate_results(state: AgentState) -> dict:
 
 
 def _route_after_aggregate(state: AgentState) -> str:
-    """aggregate_results 后路由：有 pending tool_calls 走 tools，否则走 agent。"""
+    """aggregate_results 后路由：根据 _pending_route 决定下一节点。
+
+    路由选项：
+    - "tools": 仅有普通 pending tool_calls，直接执行
+    - "interrupt_approval": pending tool_calls 含危险工具，需审批
+    - "agent": 无 pending tool_calls，回到 agent 继续对话
+    """
     return state.get("_pending_route", "agent")
 
 
@@ -557,7 +647,7 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
 
     llm = _ctx_llm_ref.get()
     if llm is None:
-        return {"plan": "", "_phase": "all", "_stall_count": 0}
+        return {"plan": "", "_phase": "gather", "_stall_count": 0}
 
     # 提取用户最近的请求
     user_request = ""
@@ -572,7 +662,7 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
             break
 
     if not user_request.strip():
-        return {"plan": "", "_phase": "all", "_stall_count": 0}
+        return {"plan": "", "_phase": "gather", "_stall_count": 0}
 
     planning_input = _PLANNER_PROMPT.format(request=user_request)
     try:
@@ -600,7 +690,10 @@ def _extract_phase(plan_text: str) -> str:
     查找 [阶段: xxx] 标记，未找到时根据内容推断：
     - 包含修改/编辑/写入关键词 → "modify"
     - 包含搜索/查找/阅读关键词 → "gather"
-    - 默认 → "all"（兜底，全量工具）
+    - 默认 → "gather"（任何新任务都应先收集信息再修改）
+
+    注：默认值从 "all" 改为 "gather"，确保 P3 自适应工具选择
+    在大多数场景下生效。"all" 只在停滞兜底时使用。
     """
     match = re.search(r'\[阶段[:：]\s*(gather|modify|verify)\]', plan_text, re.IGNORECASE)
     if match:
@@ -613,7 +706,7 @@ def _extract_phase(plan_text: str) -> str:
     if re.search(r'(搜索|查找|阅读|分析|检查)', plan_text):
         return "gather"
 
-    return "all"
+    return "gather"
 
 
 def _bind_tools_for_phase(llm, all_tools, llm_with_all_tools, phase: str, stall_count: int):
@@ -679,7 +772,7 @@ def _advance_phase(state: AgentState) -> dict:
       b) 如果 agent 不再调用写工具，phase 不会继续推进
       c) 如果 agent 仍调用写工具，phase 保持 modify，行为一致
     """
-    phase = state.get("_phase", "all") or "all"
+    phase = state.get("_phase", "gather") or "gather"
     stall_count = state.get("_stall_count", 0) or 0
 
     last = state["messages"][-1] if state["messages"] else None
@@ -753,10 +846,19 @@ def _advance_phase(state: AgentState) -> dict:
                 tc for tc in last.tool_calls if tc["name"] != "dispatch_subagent_lg"
             ]
             pending_calls = other_calls
+            if other_calls:
+                logger.info(
+                    "[D4] 混合调用暂存: %d 个子代理 + %d 个普通/危险工具, "
+                    "非子代理调用已暂存到 _pending_tool_calls",
+                    len(subagent_calls), len(other_calls),
+                )
 
     result = {"_phase": new_phase, "_stall_count": new_stall}
     if pending_calls:
         result["_pending_tool_calls"] = pending_calls
+    elif state.get("_pending_tool_calls"):
+        # 无新 pending_calls 但 state 中有残留值，清空避免误判
+        result["_pending_tool_calls"] = []
     return result
 
 
@@ -792,7 +894,7 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
     if not has_checkpointer:
         # 无 checkpointer：interrupt() 无法工作
         tool_names = ", ".join(tc["name"] for tc in dangerous_calls)
-        auto_approve = os.environ.get("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true").lower() in ("true", "1", "yes")
+        auto_approve = os.environ.get("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "false").lower() in ("true", "1", "yes")
         if auto_approve:
             logger.warning(
                 "[D7] 无 checkpointer，危险工具自动放行: %s。"
@@ -845,7 +947,7 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
         reject_msg = AIMessage(
             content=f"[人工审批] 以下操作已被拒绝: {tool_names}"
         )
-        current_phase = state.get("_phase", "all")
+        current_phase = state.get("_phase", "gather")
         rollback_phase = "gather" if current_phase in ("modify", "verify") else current_phase
         return {"messages": [reject_msg], "_approval_next": "agent", "_phase": rollback_phase, "_stall_count": 0}
 
@@ -927,7 +1029,7 @@ def create_agent_graph(
                 view = [plan_msg] + view
 
         # 步骤4: 自适应工具选择（P3）— 根据 _phase 过滤工具
-        phase = state.get("_phase", "all")
+        phase = state.get("_phase", "gather")
         stall_count = state.get("_stall_count", 0)
         llm_bound = _bind_tools_for_phase(llm, tools, llm_with_tools, phase, stall_count)
 

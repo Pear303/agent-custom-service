@@ -983,6 +983,9 @@ async def run_test():
     from dotenv import load_dotenv
     load_dotenv()
 
+    # 测试环境允许无 checkpointer 时自动放行危险工具
+    os.environ.setdefault("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true")
+
     # 检查 API Key
     if not os.environ.get("DEEPSEEK_API_KEY") or \
        os.environ["DEEPSEEK_API_KEY"] == "your_api_key_here":

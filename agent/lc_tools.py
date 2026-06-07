@@ -14,6 +14,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
 
+from pydantic import BaseModel, Field
+
 from langchain_core.tools import tool
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
@@ -153,6 +155,11 @@ def _resolve(path: str) -> Path:
                 try:
                     stripped = p.relative_to(prefix)
                     if stripped != p:
+                        import logging as _logging
+                        _logging.getLogger(__name__).info(
+                            "路径前缀剥离: '%s' → '%s' (剥离前缀 '%s')",
+                            p, stripped, prefix,
+                        )
                         p = stripped
                         break
                 except ValueError:
@@ -274,6 +281,26 @@ def _edit_context_preview(content: str, replace_start: int, new_text: str, conte
         preview_lines.append(f"{marker} {i + 1:4d} | {line_content}")
 
     return "修改后上下文:\n" + "\n".join(preview_lines)
+
+
+def _get_actual_snippet(content: str, start_line: int, line_count: int, context_lines: int = 3) -> str:
+    """获取文件指定行区域的实际内容，用于 edit_file 失败时帮助 Agent 定位。
+
+    Args:
+        content: 文件完整内容
+        start_line: 起始行号（0-based）
+        line_count: 要显示的行数
+        context_lines: 上下文行数
+    """
+    lines = content.splitlines(keepends=True)
+    s = max(0, start_line - context_lines)
+    e = min(len(lines), start_line + line_count + context_lines)
+    result = []
+    for i in range(s, e):
+        marker = ">>>" if start_line <= i < start_line + line_count else "   "
+        line_content = lines[i].rstrip("\r\n") if i < len(lines) else ""
+        result.append(f"{marker} {i + 1:4d} | {line_content}")
+    return "\n".join(result)
 
 
 def _find_matches(content: str, old: str) -> list[tuple[int, int]]:
@@ -474,7 +501,13 @@ def read_file(path: str, offset: int = 1, limit: Optional[int] = None) -> str:
 #  write_file
 # ═══════════════════════════════════════════════════════════════════
 
-@tool
+class WriteFileArgs(BaseModel):
+    """write_file 的参数 schema。"""
+    path: str = Field(description='文件路径（相对于工作区，如 "index.html" 或 "css/style.css"）。必填，不能省略。')
+    content: str = Field(description='要写入的文件内容')
+
+
+@tool(args_schema=WriteFileArgs)
 def write_file(path: str, content: str) -> str:
     """写入文件（覆盖已有内容）。部分编辑请用 edit_file。
     Args:
@@ -554,7 +587,7 @@ def edit_file(
             return f"Successfully edited {_display_path(fp, Path(__file__).parent.parent)}"
         matches = _find_matches(content, norm_old)  # 查找匹配位置
         if not matches:
-            # 未找到匹配，返回最相似位置的差异对比
+            # 未找到匹配，返回最相似位置的差异对比 + 实际文件内容
             ratio, start = _best_window(norm_old, content)
             if ratio > 0.5:
                 best_lines = content.splitlines(keepends=True)
@@ -565,8 +598,12 @@ def edit_file(
                     fromfile="old_text (provided)",
                     tofile=f"{path} (actual, line {start + 1})",
                 ))
-                return f"Error: old_text not found in {path}.\nBest match ({ratio:.0%}) at line {start + 1}:\n{diff}"
-            return f"Error: old_text not found in {path}."
+                # 返回实际文件内容区域，帮助 Agent 修正 old_text
+                actual_snippet = _get_actual_snippet(content, start, w)
+                return f"Error: old_text not found in {path}.\nBest match ({ratio:.0%}) at line {start + 1}:\n{diff}\n\nActual file content around line {start + 1}:\n{actual_snippet}\nTip: Use read_file to get the latest content, then retry with the correct old_text."
+            # 即使相似度低，也返回文件开头内容帮助定位
+            actual_snippet = _get_actual_snippet(content, 0, 20)
+            return f"Error: old_text not found in {path}.\nFile beginning:\n{actual_snippet}\nTip: Use read_file to get the latest content, then retry with the correct old_text."
         if len(matches) > 1 and not replace_all:
             lines = [content.count('\n', 0, s) + 1 for s, _ in matches]
             preview = ", ".join(f"line {n}" for n in lines[:3])
@@ -612,12 +649,45 @@ def run_command(command: str) -> str:
         )
     cwd = str(workspace) if workspace else None
 
+    # D11: 拦截无意义的路径探测命令，减少 token 浪费
+    # Agent 已在 system_prompt 中被告知 CWD，无需反复探测
+    _wasteful_commands = {"pwd", "cd", "dir", "ls", "get-location", "echo %cd%"}
+    cmd_stripped = command.strip().lower()
+    if cmd_stripped in _wasteful_commands:
+        return f"[提示] 你的工作目录已设定为: {cwd}\n请直接使用相对路径操作文件，无需探测目录。"
+
+    # D16: 拦截文件操作类 shell 命令，防止 Agent 绕过专用工具在 workspace 外创建/移动文件
+    # Agent 应使用 write_file/edit_file/read_file 等专用工具操作文件，
+    # 而非通过 copy/move/mkdir 等 shell 命令，避免路径约束被绕过
+    _file_op_commands = {
+        "copy", "xcopy", "move", "rename", "del", "rm", "rmdir",
+        "mkdir", "md", "cp", "mv", "touch", "new-item",
+    }
+    # 提取命令首词（跳过前导空白和引号）
+    first_word = command.strip().split()[0].strip('"').lower() if command.strip() else ""
+    if first_word in _file_op_commands:
+        return (
+            f"Error: 禁止使用 '{first_word}' 命令操作文件。"
+            f"请使用专用工具：write_file（创建/覆盖文件）、edit_file（编辑文件）、"
+            f"read_file（读取文件）、glob_tool（查找文件）。"
+            f"这些工具会自动处理路径解析和工作区约束。"
+        )
+
     result = subprocess.run(
         command, shell=True, capture_output=True,
         encoding="utf-8", errors="replace",
         cwd=cwd,
     )
-    return result.stdout or result.stderr
+    output = result.stdout or result.stderr
+
+    # D12: 截断过长输出，减少回传 token 消耗
+    _MAX_OUTPUT_CHARS = 4000
+    if len(output) > _MAX_OUTPUT_CHARS:
+        head = output[:_MAX_OUTPUT_CHARS // 2]
+        tail = output[-_MAX_OUTPUT_CHARS // 2:]
+        output = f"{head}\n\n... [输出已截断，共 {len(output)} 字符] ...\n\n{tail}"
+
+    return output
 
 
 # ═══════════════════════════════════════════════════════════════════

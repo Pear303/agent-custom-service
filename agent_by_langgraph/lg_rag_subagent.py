@@ -24,7 +24,7 @@ import logging
 from typing import Annotated, Sequence, TypedDict
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
 
@@ -108,16 +108,66 @@ async def _web_fallback(state: RAGSubagentState, config: RunnableConfig) -> dict
 
 
 def _post_tools(state: RAGSubagentState) -> dict:
-    """tools 节点之后：递减剩余轮数；归零时注入终止消息。"""
+    """tools 节点之后：递减剩余轮数；归零时注入终止消息。
+
+    轮数耗尽时补全未响应的 tool_calls，防止消息序列不合法导致 API 400。
+    """
     remaining = state["turns_remaining"] - 1
     if remaining <= 0:
+        new_messages = []
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            for tc in last.tool_calls:
+                new_messages.append(ToolMessage(
+                    content="[轮数耗尽，工具调用被截断]",
+                    tool_call_id=tc["id"],
+                    name=tc["name"],
+                    status="error",
+                ))
+        new_messages.append(AIMessage(content="[子代理已达最大轮数限制，任务可能未完成]"))
         return {
             "turns_remaining": 0,
-            "messages": [
-                AIMessage(content="[子代理已达最大轮数限制，任务可能未完成]")
-            ],
+            "messages": new_messages,
         }
     return {"turns_remaining": remaining}
+
+
+def _ensure_rag_message_integrity(msgs: list[BaseMessage]) -> list[BaseMessage]:
+    """确保消息序列完整性：AIMessage(tool_calls) 后必须紧跟所有对应的 ToolMessage。"""
+    if not msgs:
+        return msgs
+
+    result = list(msgs)
+    i = 0
+    while i < len(result):
+        msg = result[i]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            expected_ids = {tc["id"] for tc in msg.tool_calls}
+            responded_ids = set()
+            j = i + 1
+            while j < len(result) and isinstance(result[j], ToolMessage):
+                responded_ids.add(result[j].tool_call_id)
+                j += 1
+            missing_ids = expected_ids - responded_ids
+            if missing_ids:
+                id_to_name = {tc["id"]: tc["name"] for tc in msg.tool_calls}
+                patch = []
+                for mid in missing_ids:
+                    patch.append(ToolMessage(
+                        content="[工具调用被截断，响应缺失]",
+                        tool_call_id=mid,
+                        name=id_to_name.get(mid, "unknown"),
+                        status="error",
+                    ))
+                    logger.warning(
+                        "[CRAG] 补全缺失 ToolMessage: tool_call_id=%s, name=%s",
+                        mid, id_to_name.get(mid, "unknown"),
+                    )
+                for k, pm in enumerate(patch):
+                    result.insert(j + k, pm)
+                i += len(patch)
+        i += 1
+    return result
 
 
 # ── 子图构建 ──────────────────────────────────────────────────
@@ -220,6 +270,9 @@ def create_rag_subagent_graph(
             msgs.append(HumanMessage(content=state["input"]))
         else:
             msgs = existing
+
+        # 消息完整性校验：确保 AIMessage(tool_calls) 后紧跟所有对应的 ToolMessage
+        msgs = _ensure_rag_message_integrity(msgs)
 
         response = await llm_with_tools.ainvoke(msgs, config=config)
         return {"messages": [response]}

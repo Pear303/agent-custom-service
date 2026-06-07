@@ -12,9 +12,12 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Sequence, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+logger = logging.getLogger(__name__)
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
 
@@ -37,6 +40,54 @@ class SubagentState(TypedDict):
     max_turns: int
 
 
+def _ensure_message_integrity(msgs: list[BaseMessage]) -> list[BaseMessage]:
+    """确保消息序列完整性：AIMessage(tool_calls) 后必须紧跟所有对应的 ToolMessage。
+
+    ParallelToolNode 分割执行只读/非只读工具时，可能遗漏某些 tool_call_id 的响应，
+    导致下次 LLM 调用时 API 报 400。此函数检测并补全缺失的 ToolMessage。
+    """
+    if not msgs:
+        return msgs
+
+    result = list(msgs)
+    i = 0
+    while i < len(result):
+        msg = result[i]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            # 收集此 AIMessage 之后的 ToolMessage 的 tool_call_id
+            expected_ids = {tc["id"] for tc in msg.tool_calls}
+            responded_ids = set()
+            j = i + 1
+            while j < len(result) and isinstance(result[j], ToolMessage):
+                responded_ids.add(result[j].tool_call_id)
+                j += 1
+
+            # 补全缺失的 ToolMessage
+            missing_ids = expected_ids - responded_ids
+            if missing_ids:
+                # 找到缺失 id 对应的 tool name
+                id_to_name = {tc["id"]: tc["name"] for tc in msg.tool_calls}
+                patch = []
+                for mid in missing_ids:
+                    patch.append(ToolMessage(
+                        content="[工具调用被截断，响应缺失]",
+                        tool_call_id=mid,
+                        name=id_to_name.get(mid, "unknown"),
+                        status="error",
+                    ))
+                    logger.warning(
+                        "[子代理] 补全缺失 ToolMessage: tool_call_id=%s, name=%s",
+                        mid, id_to_name.get(mid, "unknown"),
+                    )
+                # 在 j 位置插入补全消息
+                for k, pm in enumerate(patch):
+                    result.insert(j + k, pm)
+                i += len(patch)  # 跳过插入的消息
+        i += 1
+
+    return result
+
+
 def _route_after_agent(state: SubagentState) -> str:
     """agent 节点后路由：有 tool_calls 走 tools，否则直接 END。"""
     last = state["messages"][-1]
@@ -46,16 +97,32 @@ def _route_after_agent(state: SubagentState) -> str:
 
 
 def _post_tools(state: SubagentState) -> dict:
-    """tools 节点之后：递减剩余轮数；归零时注入终止消息以强制 END。"""
+    """tools 节点之后：递减剩余轮数；归零时注入终止消息以强制 END。
+
+    轮数耗尽时，如果上一条 AIMessage 有未响应的 tool_calls，
+    先补全对应的 ToolMessage（避免 API 400 错误），再注入终止消息。
+    """
     remaining = state["turns_remaining"] - 1
     if remaining <= 0:
+        new_messages = []
+        # 补全未响应的 tool_calls，防止消息序列不合法导致 API 400
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            for tc in last.tool_calls:
+                new_messages.append(ToolMessage(
+                    content="[轮数耗尽，工具调用被截断]",
+                    tool_call_id=tc["id"],
+                    name=tc["name"],
+                    status="error",
+                ))
+        new_messages.append(
+            AIMessage(
+                content="[子代理已达最大轮数限制，任务可能未完成]"
+            )
+        )
         return {
             "turns_remaining": 0,
-            "messages": [
-                AIMessage(
-                    content="[子代理已达最大轮数限制，任务可能未完成]"
-                )
-            ],
+            "messages": new_messages,
         }
     return {"turns_remaining": remaining}
 
@@ -108,6 +175,11 @@ def create_subagent_graph(llm, spec: SubagentSpec, checkpointer=None):
             # 后续轮次：existing 已含 SystemMessage + HumanMessage + AIMessage + ToolMessage
             # 直接使用，不重复注入 SystemMessage
             msgs = list(existing)
+
+        # 消息完整性校验：确保 AIMessage(tool_calls) 后紧跟所有对应的 ToolMessage
+        # ParallelToolNode 分割执行时可能遗漏某些 tool_call_id 的响应
+        msgs = _ensure_message_integrity(msgs)
+
         response = await llm_with_tools.ainvoke(msgs, config=config)
         return {"messages": [response]}
 

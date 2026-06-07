@@ -9,6 +9,14 @@ import threading
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
+# D15: Windows 控制台 UTF-8 编码修复，防止中文乱码
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -195,12 +203,34 @@ class LGAgent:
         workspace = _build_workspace(self.root, user_id, ticket_id)
         cwd_hint = (
             f"\n\n---\n\n# Current Working Directory\n\n"
-            f"你的当前工作目录（CWD）是: `{workspace}`\n"
-            f"所有文件操作（read_file, write_file, edit_file）的路径都相对于此目录解析。\n"
-            f"例如：`read_file('src/app.py')` 实际读取 `{workspace}/src/app.py`。\n"
-            f"请始终使用相对于此目录的路径，不要使用绝对路径或猜测路径。"
+            f"你的当前工作目录（CWD）是: `{workspace}`\n\n"
+            f"**关键规则**：\n"
+            f"1. 所有文件操作（read_file, write_file, edit_file）的路径都相对于此目录解析\n"
+            f"2. 例如：`read_file('src/app.py')` 实际读取 `{workspace}/src/app.py`\n"
+            f"3. **禁止**使用 `pwd`、`cd`、`dir` 等命令探测工作目录 — 你已经知道 CWD\n"
+            f"4. **禁止**使用 `..\\` 或 `../` 等相对路径跳出工作目录\n"
+            f"5. **禁止**使用绝对路径 — 所有路径都应相对于 CWD\n"
+            f"6. run_command 自动在 CWD 下执行，无需手动 cd\n"
+            f"7. 如果需要查看目录内容，使用 `glob_tool` 而非 `dir` 命令\n"
+            f"8. **禁止**使用 `copy`、`move`、`mkdir`、`del`、`rm` 等 shell 命令操作文件 — "
+            f"请使用 `write_file`（创建/覆盖）、`edit_file`（编辑）、`read_file`（读取）、"
+            f"`glob_tool`（查找）等专用工具，它们会自动处理路径解析和工作区约束\n"
+            f"9. **禁止**在 run_command 中使用绝对路径执行 Python 脚本 — "
+            f"使用 `python 相对路径` 即可，run_command 自动在 CWD 下执行"
         )
         system_prompt += cwd_hint
+
+        # D13: 约束 update_todos 使用频率，减少无效 token 消耗
+        todo_constraint = (
+            "\n\n---\n\n# 工具使用约束\n\n"
+            "- **update_todos**: 只在关键里程碑更新（如：开始任务、完成一个主要步骤、遇到阻塞），"
+            "不要每修改一个文件就更新一次。每次修改后更新 todo 列表是浪费 token 的行为。\n"
+            "- **run_command**: 你已在正确的工作目录下，无需使用 pwd/cd/dir 探测路径。\n"
+            "- **read_file**: 优先使用 offset/limit 参数读取大文件的关键部分，而非整个文件。\n"
+            "- **dispatch_subagent_lg**: gather（信息收集）阶段只能派遣只读子代理，"
+            "需要修改文件的子代理请等待进入 modify 阶段后再派遣。"
+        )
+        system_prompt += todo_constraint
 
         # 初始化 LangGraph Checkpointer（SQLite 持久化）
         # 启用后支持：状态持久化、时间旅行调试、断点续跑
@@ -218,12 +248,18 @@ class LGAgent:
         """判断当前 Agent 是否将拥有（或已拥有）checkpointer。
 
         统一判断逻辑，避免 run() 和 arun_stream() 中重复推断。
-        覆盖两种场景：
-        1. checkpointer 已初始化：graph.checkpointer is not None
-        2. checkpointer 延迟初始化：_checkpointer_db_path 存在但尚未初始化
+        覆盖三种场景：
+        1. checkpointer 已初始化：_checkpointer_initialized 为 True
+        2. checkpointer 已注入：graph.checkpointer is not None
+        3. checkpointer 延迟初始化：_checkpointer_db_path 存在但尚未初始化
+
+        ⚠️ 重要：调用方应使用此属性或 checkpointer_ready 判断 checkpointer 状态，
+        而非直接检查 graph.checkpointer is not None（延迟初始化期间为 None）。
+        直接检查 graph.checkpointer 会在 _ensure_checkpointer() 调用前误判为无 checkpointer。
         """
         return (
-            self.graph.checkpointer is not None
+            getattr(self, '_checkpointer_initialized', False)
+            or self.graph.checkpointer is not None
             or getattr(self, '_checkpointer_db_path', None) is not None
         )
 
@@ -426,7 +462,7 @@ class LGAgent:
                 # _ensure_checkpointer 可能重新编译图，需更新 config 中的回调
                 config["callbacks"] = list(getattr(self.graph, '_lg_llm_callbacks', []))
                 config["callbacks"].extend([self._reasoning_collector, stream_handler])
-                config["configurable"]["__has_checkpointer__"] = self.graph.checkpointer is not None
+                config["configurable"]["__has_checkpointer__"] = self.checkpointer_ready
                 current_input = input_state
                 max_interrupt_retries = 30
                 for _ in range(max_interrupt_retries):
@@ -538,6 +574,14 @@ class LGAgent:
             checkpointer = await ctx.__aenter__()
             self._checkpointer_ctx = ctx
 
+            # 启用 WAL 模式：写操作不阻塞读，高并发下性能显著提升
+            try:
+                await checkpointer.db.execute("PRAGMA journal_mode=WAL")
+                await checkpointer.db.execute("PRAGMA busy_timeout=5000")
+                logger.info("[Checkpointer] WAL 模式已启用: %s", self._checkpointer_db_path)
+            except Exception as wal_exc:
+                logger.warning("[Checkpointer] WAL 模式设置失败（不影响功能）: %s", wal_exc)
+
             # 保存旧图的回调列表，确保重新编译后不丢失
             old_callbacks = list(getattr(self.graph, '_lg_llm_callbacks', []))
 
@@ -616,7 +660,7 @@ class LGAgent:
         await self._ensure_checkpointer()
         # _ensure_checkpointer 可能重新编译图，需更新 config 中的回调
         config["callbacks"] = list(getattr(self.graph, '_lg_llm_callbacks', []))
-        config["configurable"]["__has_checkpointer__"] = self.graph.checkpointer is not None
+        config["configurable"]["__has_checkpointer__"] = self.checkpointer_ready
 
         # 使用 astream_events 流式输出，自动处理 interrupt 恢复
         from langgraph.types import Command

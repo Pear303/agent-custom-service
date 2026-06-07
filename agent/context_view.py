@@ -117,11 +117,21 @@ def _ensure_tool_call_integrity(messages: list[BaseMessage]) -> list[BaseMessage
                 continue
             if len(complete_calls) < len(msg.tool_calls):
                 # 部分 tool_calls 缺少 ToolMessage，创建新的 AIMessage 只保留完整的
+                # 同步过滤 additional_kwargs 中的 tool_calls，
+                # 否则 OpenAI 序列化器会读取 additional_kwargs["tool_calls"]（原始格式），
+                # 导致 API 收到已删除的 tool_call_id 但找不到对应 ToolMessage
+                complete_ids = {tc.get("id") for tc in complete_calls}
+                new_additional_kwargs = dict(msg.additional_kwargs)
+                if "tool_calls" in new_additional_kwargs:
+                    new_additional_kwargs["tool_calls"] = [
+                        tc for tc in new_additional_kwargs["tool_calls"]
+                        if tc.get("id") in complete_ids
+                    ]
                 new_msg = AIMessage(
                     content=msg.content,
                     tool_calls=complete_calls,
                     id=msg.id,
-                    additional_kwargs=msg.additional_kwargs,
+                    additional_kwargs=new_additional_kwargs,
                 )
                 result.append(new_msg)
             else:
@@ -294,6 +304,7 @@ class ContextView:
                     if i in idx_to_group_2:
                         gi = idx_to_group_2[i]
                         group = groups_2[gi]
+                        # 必须整组添加完再检查 min_window，避免组内断裂
                         for j in group:
                             if j not in kept:
                                 result.append(messages[j])
@@ -301,7 +312,8 @@ class ContextView:
                     else:
                         result.append(messages[i])
                         kept.add(i)
-                    if len(result) >= self.min_window:
+                    # 只在非工具调用组消息或整组添加完成后检查
+                    if i not in idx_to_group_2 and len(result) >= self.min_window:
                         break
             # 按原始顺序排序
             result.sort(key=lambda m: messages.index(m))

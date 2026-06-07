@@ -52,10 +52,19 @@ def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
     dangerous = set(spec_tool_names) & _DANGEROUS_TOOLS
     if dangerous:
         import logging
-        logging.getLogger("agent.audit").warning(
+        import os
+        audit_logger = logging.getLogger("agent.audit")
+        audit_logger.warning(
             "SUBAGENT_DANGEROUS_TOOLS | tools=%s | note=subagent_has_no_interrupt_gate",
             ", ".join(dangerous),
         )
+        # 如果设置了过滤模式，自动移除危险工具
+        if os.environ.get("SUBAGENT_FILTER_DANGEROUS", "false").lower() in ("true", "1", "yes"):
+            audit_logger.warning(
+                "SUBAGENT_FILTER_DANGEROUS | removed=%s | agent=%s",
+                ", ".join(dangerous), ", ".join(spec_tool_names),
+            )
+            spec_tool_names = tuple(n for n in spec_tool_names if n not in _DANGEROUS_TOOLS)
 
     tool_map = {
         "run_command": run_command,

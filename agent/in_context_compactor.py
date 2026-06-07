@@ -21,6 +21,9 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+# 防御性导入：确保工具调用完整性后验证可用
+from agent.context_view import _ensure_tool_call_integrity
+
 
 # 保留最近 N 步的工具结果完整
 _KEEP_RECENT_STEPS = 5
@@ -103,7 +106,9 @@ class InContextCompactor:
         if total_tokens <= threshold:
             return messages  # 不需要压缩
 
-        return self._truncate_old_tool_messages(messages, total_tokens, threshold)
+        result = self._truncate_old_tool_messages(messages, total_tokens, threshold)
+        # 防御性后验证：确保截断未破坏工具调用完整性
+        return _ensure_tool_call_integrity(result)
 
     def _truncate_old_tool_messages(
         self,

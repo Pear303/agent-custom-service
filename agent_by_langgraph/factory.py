@@ -162,8 +162,8 @@ def create_lg_agent(
             logger.info("[Factory] Agent 缓存淘汰: %s", evicted_key)
 
     # 区分"无 checkpointer"和"延迟初始化待完成"
-    cp_status = "lazy" if agent.graph.checkpointer is None and hasattr(agent, '_ensure_checkpointer') else (
-        "ready" if agent.graph.checkpointer is not None else "none"
+    cp_status = "ready" if agent.checkpointer_ready else (
+        "lazy" if agent.will_have_checkpointer else "none"
     )
     logger.info(
         "[Factory] Agent 新建: user_id=%s, checkpointer=%s, 缓存大小=%d",

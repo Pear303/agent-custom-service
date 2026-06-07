@@ -92,7 +92,7 @@ class ReasoningCollector(BaseCallbackHandler):
         return self.ai_messages[-1] if self.ai_messages else None
 
 
-class LangGraphAgent:
+class LGAgent:
     """基于 LangGraph StateGraph 的智能代理类。
 
     功能等价于 LCAgent，使用 StateGraph + ToolNode 替代 AgentExecutor。

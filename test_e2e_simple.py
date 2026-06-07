@@ -256,7 +256,7 @@ async def _call_lg_agent(prompt: str, user_id: str, ticket_id: str,
     agent.graph.checkpointer = None
     has_checkpointer = False
 
-    # 构造输入（加锁保护 _first_turn 读写，与 LangGraphAgent.run() 保持一致）
+    # 构造输入（加锁保护 _first_turn 读写，与 LGAgent.run() 保持一致）
     async with agent._async_invoke_lock:
         is_first_turn = agent._first_turn
         if is_first_turn or not has_checkpointer:

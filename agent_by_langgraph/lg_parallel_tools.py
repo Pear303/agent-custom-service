@@ -36,6 +36,7 @@ _READ_ONLY_TOOLS = frozenset({
     "glob_tool",
     "grep_tool",
     "load_skill",
+    "rag_search",
 })
 
 

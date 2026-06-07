@@ -26,11 +26,14 @@
 """
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from operator import add
 import re
 import threading
 from typing import Annotated, Sequence, TypedDict
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -137,7 +140,7 @@ class SubagentWorkerState(TypedDict):
     每个 Send("subagent_worker", ...) 创建一个独立的 worker 实例，
     拥有自己的 state，不与主 AgentState 共享。
     """
-    agent_type: str
+    agent_name: str
     task: str
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
@@ -153,6 +156,10 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
     3. 有危险工具调用 → interrupt_approval（安全审批）
     4. 普通工具调用 → tools
     """
+    
+    print(f"[路由] 最后消息类型: {type(state['messages'][-1]).__name__}, "
+          f"有 tool_calls? {bool(state['messages'][-1].tool_calls)}")
+    
     last = state["messages"][-1]
 
     if not isinstance(last, AIMessage) or not last.tool_calls:
@@ -202,7 +209,7 @@ def _subagent_dispatcher(state: AgentState) -> list[Send]:
             sends.append(Send(
                 "subagent_worker",
                 {
-                    "agent_type": tc["args"]["agent_type"],
+                    "agent_name": tc["args"]["agent_name"],
                     "task": tc["args"]["task"],
                     "messages": [],
                 },
@@ -226,7 +233,7 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
     - 优先提取 ## 结论 段落，否则取最后 3 行
     - 输出结构化格式：类型、摘要、文件、结论
     """
-    from agent.lc_tools import _ctx_llm_ref, _ctx_subagent_registry, _ctx_user_id
+    from agent.lc_tools import _ctx_llm_ref, _ctx_sub_reg, _ctx_user_id
     from agent_by_langgraph.lg_subagent import get_subagent_graph
     from agent_by_langgraph.context_var_manager import snapshot as _ctx_snapshot, restore as _ctx_restore
 
@@ -234,27 +241,27 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
     ctx_snap = _ctx_snapshot()
 
     try:
-        registry = _ctx_subagent_registry.get()
+        registry = _ctx_sub_reg.get()
         llm = _ctx_llm_ref.get()
-        agent_type = state["agent_type"]
+        agent_name = state["agent_name"]
         task = state["task"]
 
         if registry is None:
-            return {"subagent_results": [f"[{agent_type}] Error: Subagent registry not initialized"]}
+            return {"subagent_results": [f"[{agent_name}] Error: Subagent registry not initialized"]}
         if llm is None:
-            return {"subagent_results": [f"[{agent_type}] Error: LLM not initialized"]}
+            return {"subagent_results": [f"[{agent_name}] Error: LLM not initialized"]}
 
-        spec = registry.get(agent_type)
+        spec = registry.get(agent_name)
         if spec is None:
             available = ", ".join(registry.names())
-            return {"subagent_results": [f"[{agent_type}] Error: unknown subagent. Available: {available}"]}
+            return {"subagent_results": [f"[{agent_name}] Error: unknown subagent. Available: {available}"]}
 
-        print(f"\n[LG 并行子代理 · {agent_type}]: {task[:80]}")
+        print(f"\n[LG 并行子代理 · {agent_name}]: {task[:80]}")
 
         # 构造子代理的 checkpointer 和隔离 thread_id
         import time
         user_id = _ctx_user_id.get() or "default"
-        sub_thread_id = f"{user_id}:sub:{agent_type}:{int(time.time() * 1000)}"
+        sub_thread_id = f"{user_id}:sub:{agent_name}:{int(time.time() * 1000)}"
 
         # 尝试从主图的 checkpointer 复用（同类型子代理共享 checkpointer 实例）
         # _subagent_worker 是 async 节点，已在事件循环中，
@@ -288,16 +295,25 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
             logger.warning("[SubCheckpointer] 初始化失败，降级为无状态执行: %s", exc)
 
         try:
-            subgraph = get_subagent_graph(llm, registry, agent_type, checkpointer=sub_checkpointer)
+            subgraph = get_subagent_graph(llm, registry, agent_name, checkpointer=sub_checkpointer)
             sub_config = {"configurable": {"thread_id": sub_thread_id}}
-            result = await subgraph.ainvoke({
+            # CRAG 子图需要额外的状态字段
+            sub_input = {
                 "input": task,
                 "turns_remaining": spec.max_turns,
                 "max_turns": spec.max_turns,
                 "messages": [],
-            }, config=sub_config)
+            }
+            if spec.is_rag:
+                sub_input.update({
+                    "rewritten_queries": [],
+                    "retrieved_docs": [],
+                    "rag_context": "",
+                    "needs_web_fallback": False,
+                })
+            result = await subgraph.ainvoke(sub_input, config=sub_config)
         except Exception as exc:
-            return {"subagent_results": [f"[{agent_type}] Error: {exc}"]}
+            return {"subagent_results": [f"[{agent_name}] Error: {exc}"]}
 
         # 提取最后一条 AIMessage 的文本
         last_text = ""
@@ -308,11 +324,11 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
                 break
 
         if not last_text:
-            return {"subagent_results": [f"[{agent_type}] [子代理未产出任何回复]"]}
+            return {"subagent_results": [f"[{agent_name}] [子代理未产出任何回复]"]}
 
         # 就地压缩：提取结论 + 结构化格式
-        compressed = _compress_subagent_result(last_text, agent_type=agent_type)
-        print(f"[LG 子代理汇报 · {agent_type}]: {compressed[:200]}")
+        compressed = _compress_subagent_result(last_text, agent_name=agent_name)
+        print(f"[LG 子代理汇报 · {agent_name}]: {compressed[:200]}")
         return {"subagent_results": [compressed]}
     finally:
         # 恢复 ContextVar，防止子代理内部修改影响其他并行 worker
@@ -383,12 +399,12 @@ _MAX_CONCLUSION_CHARS = 1200
 def _compress_subagent_result(
     result: str,
     max_chars: int = _MAX_SUBAGENT_CHARS,
-    agent_type: str = "",
+    agent_name: str = "",
 ) -> str:
     """压缩子代理结果为结构化格式。
 
     输出格式：
-        [子代理类型] 摘要(≤50字)
+        [子代理名称] 摘要(≤50字)
         - 涉及文件: file1.py:10, file2.ts:42
         - 结论: ...
 
@@ -398,7 +414,7 @@ def _compress_subagent_result(
     3. 退化为取最后 3 行作为结论
     4. 附加文件路径（含行号）
     """
-    prefix = f"[{agent_type}] " if agent_type else ""
+    prefix = f"[{agent_name}] " if agent_name else ""
 
     # 短结果直接返回
     if len(result) <= max_chars:

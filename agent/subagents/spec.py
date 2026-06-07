@@ -19,9 +19,11 @@ class SubagentSpec:
         system_prompt: 子代理的系统提示词（定义其身份和行为准则）
         tool_names: 允许使用的工具名称元组（白名单）
         max_turns: 子代理单次任务的最大迭代轮数（默认 15）
+        is_rag: 是否使用 CRAG 子图（带查询改写+文档评估的 RAG 流程）
     """
     name: str
     description: str
     system_prompt: str              # 从模板文件加载
     tool_names: tuple[str, ...]     # 工具白名单
     max_turns: int = 15             # 最大迭代轮数
+    is_rag: bool = False            # 是否使用 CRAG 子图

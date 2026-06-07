@@ -8,8 +8,8 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from agent_by_langgraph.lg_agent import LangGraphAgent
+from agent_by_langgraph.lg_agent import LGAgent
 
 if __name__ == "__main__":
-    agent = LangGraphAgent(model="deepseek-v4-flash", max_iterations=50)
+    agent = LGAgent(model="deepseek-v4-flash", max_iterations=50)
     agent.run()

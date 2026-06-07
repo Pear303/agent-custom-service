@@ -19,12 +19,13 @@ from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 
 from .subagent_parallel import ParallelAgentExecutor
+from .rag.retriever import rag_search
 
 # 异步安全的上下文存储，每个协程独立
 _ctx_workspace: ContextVar[Path | None] = ContextVar("workspace", default=None)
 _ctx_skills_loader: ContextVar[Any | None] = ContextVar("skills_loader", default=None)
 _ctx_todo_store: ContextVar[Any | None] = ContextVar("todo_store", default=None)
-_ctx_subagent_registry: ContextVar[Any | None] = ContextVar("subagent_registry", default=None)
+_ctx_sub_reg: ContextVar[Any | None] = ContextVar("sub_reg", default=None)
 _ctx_llm_ref: ContextVar[Any | None] = ContextVar("llm_ref", default=None)
 _ctx_user_id: ContextVar[str | None] = ContextVar("user_id", default=None)
 _ctx_ticket_id: ContextVar[str | None] = ContextVar("ticket_id", default=None)
@@ -52,7 +53,7 @@ def set_todo_store(store: Any) -> None:
 
 def set_subagent_deps(llm, registry) -> None:
     """设置当前上下文的子 Agent 依赖"""
-    _ctx_subagent_registry.set(registry)
+    _ctx_sub_reg.set(registry)
     _ctx_llm_ref.set(llm)
 
 
@@ -74,7 +75,7 @@ def clear_context() -> None:
     _ctx_workspace.set(None)
     _ctx_skills_loader.set(None)
     _ctx_todo_store.set(None)
-    _ctx_subagent_registry.set(None)
+    _ctx_sub_reg.set(None)
     _ctx_llm_ref.set(None)
     _ctx_user_id.set(None)
     _ctx_ticket_id.set(None)
@@ -909,14 +910,14 @@ def update_todos(todos: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @tool
-def dispatch_subagent(agent_type: str, task: str) -> str:
+def dispatch_subagent(agent_name: str, task: str) -> str:
     """派遣子代理独立处理任务。子代理有自己独立的上下文，办完只回传文字总结。
-    agent_type 可用: quick_helper, web_researcher, doc_analyzer, engine_executor, validator, skill_manager, document_processor, system_maintainer
+    agent_name 可用: quick_helper, web_researcher, doc_analyzer, engine_executor, validator, skill_manager, document_processor, system_maintainer
     Args:
-        agent_type: 子代理类型（quick_helper/web_researcher/doc_analyzer/engine_executor/validator/skill_manager/document_processor/system_maintainer）
+        agent_name: 子代理名称（quick_helper/web_researcher/doc_analyzer/engine_executor/validator/skill_manager/document_processor/system_maintainer）
         task: 要委派给子代理的具体任务描述
     """
-    subagent_registry = _ctx_subagent_registry.get()
+    subagent_registry = _ctx_sub_reg.get()
     llm_ref = _ctx_llm_ref.get()
     
     if subagent_registry is None:
@@ -924,10 +925,10 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
     if llm_ref is None:
         return "Error: LLM not initialized"
 
-    spec = subagent_registry.get(agent_type)  # 查询子代理规格
+    spec = subagent_registry.get(agent_name)  # 查询子代理规格
     if spec is None:
         available = ", ".join(subagent_registry.names())
-        return f"Error: unknown subagent '{agent_type}'. Available: {available}"
+        return f"Error: unknown subagent '{agent_name}'. Available: {available}"
 
     # 子代理的工具从白名单中筛选
     tools = [
@@ -936,7 +937,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         if name in _SUBAGENT_TOOL_MAP
     ]
     if not tools:
-        return f"Error: no tools available for subagent '{agent_type}'"
+        return f"Error: no tools available for subagent '{agent_name}'"
 
     # 子代理有自己独立的 prompt 和 executor
     prompt = ChatPromptTemplate.from_messages([
@@ -955,7 +956,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         verbose=False,
     )
 
-    print(f"\n[派遣子代理 · {agent_type}]: {task[:80]}")
+    print(f"\n[派遣子代理 · {agent_name}]: {task[:80]}")
 
     try:
         result = executor.invoke({
@@ -964,7 +965,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         })
         final = result["output"]  # ← 只回传总结，子代理内部历史不暴露
     except Exception as exc:
-        return f"Error: subagent '{agent_type}' raised: {exc}"
+        return f"Error: subagent '{agent_name}' raised: {exc}"
 
     print(f"[子代理汇报]: {final[:200]}")
     return final
@@ -980,5 +981,6 @@ _SUBAGENT_TOOL_MAP = {
     "glob": glob_tool,
     "grep": grep_tool,
     "load_skill": load_skill,
+    "rag_search": rag_search,
     # dispatch_subagent 不在其中，防止子代理递归派遣
 }

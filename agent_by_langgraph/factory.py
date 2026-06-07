@@ -1,7 +1,7 @@
 """LangGraph Agent 工厂 — 管理共享资源并按 user_id 创建/缓存独立实例。
 
 Agent 实例缓存策略：
-- 同一 user_id 复用同一个 LangGraphAgent 实例，使 Checkpointer 增量更新生效
+- 同一 user_id 复用同一个 LGAgent 实例，使 Checkpointer 增量更新生效
 - 首轮调用传入完整上下文（_first_turn=True），后续调用只传 HumanMessage
 - 缓存上限 _MAX_CACHE_SIZE，LRU 淘汰最久未使用的实例
 """
@@ -24,8 +24,8 @@ _skills_loader_cache = None
 _subagent_registry_cache = None
 _cache_lock = threading.Lock()
 
-# Agent 实例缓存：key=(user_id, ticket_id), value=LangGraphAgent
-_agent_cache: OrderedDict[str, "LangGraphAgent"] = OrderedDict()
+# Agent 实例缓存：key=(user_id, ticket_id), value=LGAgent
+_agent_cache: OrderedDict[str, "LGAgent"] = OrderedDict()
 _MAX_CACHE_SIZE = 50
 
 
@@ -78,7 +78,7 @@ def create_lg_agent(
     model: str = None,
     max_iterations: int = 50,
 ):
-    """为指定用户获取或创建 LangGraphAgent 实例。
+    """为指定用户获取或创建 LGAgent 实例。
 
     同一 user_id 复用实例，使 Checkpointer 增量更新生效：
     - 首次调用：创建新实例，_first_turn=True
@@ -86,7 +86,7 @@ def create_lg_agent(
 
     共享 LLM / SkillsLoader / SubagentRegistry 实例，只隔离 MemoryStore / TodoStore / Checkpointer。
     """
-    from agent_by_langgraph.lg_agent import LangGraphAgent
+    from agent_by_langgraph.lg_agent import LGAgent
     model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
     cache_key = f"{user_id}:{ticket_id or ''}"
@@ -107,7 +107,7 @@ def create_lg_agent(
     skills = _get_skills_loader()
     sub_reg = _get_subagent_registry()
 
-    agent = LangGraphAgent(
+    agent = LGAgent(
         user_id=user_id,
         ticket_id=ticket_id,
         model=model,

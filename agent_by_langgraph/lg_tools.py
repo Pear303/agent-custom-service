@@ -29,6 +29,7 @@ from agent.lc_tools import (
     write_file,
     _build_workspace,
 )
+from agent.rag.retriever import rag_search
 
 
 def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
@@ -52,12 +53,13 @@ def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
         "glob": glob_tool,
         "grep": grep_tool,
         "load_skill": load_skill,
+        "rag_search": rag_search,
     }
     return [tool_map[n] for n in spec_tool_names if n in tool_map]
 
 
 @tool
-def dispatch_subagent_lg(agent_type: str, task: str) -> str:
+def dispatch_subagent_lg(agent_name: str, task: str) -> str:
     """派遣子代理独立处理任务（LangGraph StateGraph 实现）。
 
     当 LLM 在同一帧发出多个 dispatch_subagent_lg 调用时，
@@ -67,12 +69,12 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
 
     单个调用时也走 Send 路径，保持一致性。
 
-    agent_type 可用值: quick_helper, web_researcher, doc_analyzer,
+    agent_name 可用值: quick_helper, web_researcher, doc_analyzer,
     engine_executor, validator, skill_manager, document_processor,
     system_maintainer（详见 `agent.subagents.registry.SubagentRegistry`）
 
     Args:
-        agent_type: 子代理类型名
+        agent_name: 子代理名称
         task: 委派给子代理的具体任务描述
 
     Returns:
@@ -90,33 +92,41 @@ def dispatch_subagent_lg(agent_type: str, task: str) -> str:
         "请检查路由逻辑是否正常。",
         stacklevel=2,
     )
-    from agent.lc_tools import _ctx_llm_ref, _ctx_subagent_registry
+    from agent.lc_tools import _ctx_llm_ref, _ctx_sub_reg
     from agent_by_langgraph.lg_subagent import get_subagent_graph
 
-    registry = _ctx_subagent_registry.get()
+    registry = _ctx_sub_reg.get()
     llm = _ctx_llm_ref.get()
     if registry is None:
         return "Error: Subagent registry not initialized"
     if llm is None:
         return "Error: LLM not initialized"
 
-    spec = registry.get(agent_type)
+    spec = registry.get(agent_name)
     if spec is None:
         available = ", ".join(registry.names())
-        return f"Error: unknown subagent '{agent_type}'. Available: {available}"
+        return f"Error: unknown subagent '{agent_name}'. Available: {available}"
 
-    print(f"\n[LG 派遣子代理(fallback) · {agent_type}]: {task[:80]}")
+    print(f"\n[LG 派遣子代理(fallback) · {agent_name}]: {task[:80]}")
 
     try:
-        subgraph = get_subagent_graph(llm, registry, agent_type)
-        result = subgraph.invoke({
+        subgraph = get_subagent_graph(llm, registry, agent_name)
+        sub_input = {
             "input": task,
             "turns_remaining": spec.max_turns,
             "max_turns": spec.max_turns,
             "messages": [],
-        })  # fallback 路径无 checkpointer，不传 config
+        }
+        if spec.is_rag:
+            sub_input.update({
+                "rewritten_queries": [],
+                "retrieved_docs": [],
+                "rag_context": "",
+                "needs_web_fallback": False,
+            })
+        result = subgraph.invoke(sub_input)  # fallback 路径无 checkpointer，不传 config
     except Exception as exc:
-        return f"Error: subagent '{agent_type}' raised: {exc}"
+        return f"Error: subagent '{agent_name}' raised: {exc}"
 
     last_text = ""
     for msg in reversed(result.get("messages", [])):

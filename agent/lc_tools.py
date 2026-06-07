@@ -19,12 +19,13 @@ from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 
 from .subagent_parallel import ParallelAgentExecutor
+from .rag.retriever import rag_search
 
 # 异步安全的上下文存储，每个协程独立
 _ctx_workspace: ContextVar[Path | None] = ContextVar("workspace", default=None)
 _ctx_skills_loader: ContextVar[Any | None] = ContextVar("skills_loader", default=None)
 _ctx_todo_store: ContextVar[Any | None] = ContextVar("todo_store", default=None)
-_ctx_subagent_registry: ContextVar[Any | None] = ContextVar("subagent_registry", default=None)
+_ctx_sub_reg: ContextVar[Any | None] = ContextVar("sub_reg", default=None)
 _ctx_llm_ref: ContextVar[Any | None] = ContextVar("llm_ref", default=None)
 _ctx_user_id: ContextVar[str | None] = ContextVar("user_id", default=None)
 _ctx_ticket_id: ContextVar[str | None] = ContextVar("ticket_id", default=None)
@@ -52,7 +53,7 @@ def set_todo_store(store: Any) -> None:
 
 def set_subagent_deps(llm, registry) -> None:
     """设置当前上下文的子 Agent 依赖"""
-    _ctx_subagent_registry.set(registry)
+    _ctx_sub_reg.set(registry)
     _ctx_llm_ref.set(llm)
 
 
@@ -74,7 +75,7 @@ def clear_context() -> None:
     _ctx_workspace.set(None)
     _ctx_skills_loader.set(None)
     _ctx_todo_store.set(None)
-    _ctx_subagent_registry.set(None)
+    _ctx_sub_reg.set(None)
     _ctx_llm_ref.set(None)
     _ctx_user_id.set(None)
     _ctx_ticket_id.set(None)
@@ -90,6 +91,26 @@ def _build_workspace(root: Path, user_id: str | None, ticket_id: str | None) -> 
         ws = root / "data" / "users" / "_anonymous"
     ws.mkdir(parents=True, exist_ok=True)
     return ws
+
+
+def get_workspace_path(root: Path | None = None, user_id: str | None = None,
+                       ticket_id: str | None = None) -> Path:
+    """获取 Agent 的工作目录路径（不创建目录）。
+
+    供外部调用方（测试脚本等）获取与 Agent 相同的工作目录，
+    确保 CWD 一致性。目录不存在时自动创建。
+
+    Args:
+        root: 项目根目录，默认为 agent 目录的父目录
+        user_id: 用户 ID
+        ticket_id: 工单 ID
+
+    Returns:
+        工作目录的 Path 对象
+    """
+    if root is None:
+        root = Path(__file__).parent.parent
+    return _build_workspace(root, user_id, ticket_id)
 
 
 def _resolve(path: str) -> Path:
@@ -219,6 +240,40 @@ def _find_trimmed(content: str, old: str, normalize: bool = False) -> list[tuple
             end -= 1
         matches.append((start, end))
     return matches
+
+
+def _edit_context_preview(content: str, replace_start: int, new_text: str, context_lines: int = 3) -> str:
+    """生成 edit_file 修改后的上下文预览，帮助 LLM 确认修改生效。
+
+    返回修改位置前后各 context_lines 行的内容，标记修改所在行。
+    """
+    lines = content.splitlines(keepends=True)
+    # 计算修改起始位置对应的行号
+    char_count = 0
+    target_line = 0
+    for i, line in enumerate(lines):
+        if char_count + len(line) > replace_start:
+            target_line = i
+            break
+        char_count += len(line)
+    else:
+        target_line = len(lines) - 1 if lines else 0
+
+    # 计算新文本跨越的行数
+    new_line_count = new_text.count("\n") + (1 if new_text and not new_text.endswith("\n") else 0)
+    end_line = min(target_line + max(new_line_count, 1), len(lines))
+
+    # 取上下文范围
+    start = max(0, target_line - context_lines)
+    end = min(len(lines), end_line + context_lines)
+
+    preview_lines = []
+    for i in range(start, end):
+        marker = ">>>" if target_line <= i < end_line else "   "
+        line_content = lines[i].rstrip("\r\n")
+        preview_lines.append(f"{marker} {i + 1:4d} | {line_content}")
+
+    return "修改后上下文:\n" + "\n".join(preview_lines)
 
 
 def _find_matches(content: str, old: str) -> list[tuple[int, int]]:
@@ -423,9 +478,16 @@ def read_file(path: str, offset: int = 1, limit: Optional[int] = None) -> str:
 def write_file(path: str, content: str) -> str:
     """写入文件（覆盖已有内容）。部分编辑请用 edit_file。
     Args:
-        path: 文件路径（相对于工作区，如 \"index.html\" 或 \"css/style.css\"）
+        path: 文件路径（相对于工作区，如 \"index.html\" 或 \"css/style.css\"）。必填，不能省略。
         content: 要写入的文件内容
     """
+    # 防御性校验：LLM 有时只传 content 不传 path，给出明确提示而非让 Pydantic 抛异常
+    if not path or not path.strip():
+        return (
+            "Error: path 参数为空。write_file 必须提供 path 参数，"
+            "例如 write_file(path='index.html', content='...')。"
+            "请重新调用并指定目标文件路径。"
+        )
     _FORBIDDEN_PREFIXES = ("data/", "data\\", "_build", "-p", "node_modules")
     stripped = path.lstrip("/\\")
     if any(stripped.startswith(prefix) for prefix in _FORBIDDEN_PREFIXES):
@@ -451,14 +513,28 @@ def write_file(path: str, content: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @tool
-def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+def edit_file(
+    path: str,
+    old_text: str = None,
+    new_text: str = None,
+    old_string: str = None,
+    new_string: str = None,
+    replace_all: bool = False,
+) -> str:
     """替换文件中的文本。容忍缩进差异和引号风格差异。若 old_text 匹配多处，需提供更多上下文或设 replace_all=true。
     Args:
         path: 文件路径（相对于工作区）
-        old_text: 要被替换的原文本
-        new_text: 替换后的新文本
+        old_text: 要被替换的原文本（优先使用，也可用 old_string）
+        new_text: 替换后的新文本（优先使用，也可用 new_string）
+        old_string: old_text 的别名，二者传一个即可
+        new_string: new_text 的别名，二者传一个即可
         replace_all: 是否替换所有匹配项（默认 False，只替换第一处）
     """
+    # 兼容 LLM 传 old_string/new_string 的情况
+    old_text = old_text if old_text is not None else old_string
+    new_text = new_text if new_text is not None else new_string
+    if old_text is None or new_text is None:
+        return "Error: 必须提供 old_text 和 new_text（或其别名 old_string/new_string）"
     try:
         fp = _resolve(path)
         if not fp.exists():
@@ -507,7 +583,10 @@ def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False
         if uses_crlf:
             new_content = new_content.replace("\n", "\r\n")  # 恢复原始换行符风格
         fp.write_bytes(new_content.encode("utf-8"))
-        return f"Successfully edited {_display_path(fp, Path(__file__).parent.parent)}"
+        # 回读修改位置附近的上下文，帮助确认修改生效
+        display = _display_path(fp, Path(__file__).parent.parent)
+        context_preview = _edit_context_preview(new_content, selected[0][0], norm_new)
+        return f"Successfully edited {display}\n{context_preview}"
     except PermissionError as e:
         return f"Error: {e}"
     except Exception as e:
@@ -909,14 +988,14 @@ def update_todos(todos: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @tool
-def dispatch_subagent(agent_type: str, task: str) -> str:
+def dispatch_subagent(agent_name: str, task: str) -> str:
     """派遣子代理独立处理任务。子代理有自己独立的上下文，办完只回传文字总结。
-    agent_type 可用: quick_helper, web_researcher, doc_analyzer, engine_executor, validator, skill_manager, document_processor, system_maintainer
+    agent_name 可用: quick_helper, web_researcher, doc_analyzer, engine_executor, validator, skill_manager, document_processor, system_maintainer
     Args:
-        agent_type: 子代理类型（quick_helper/web_researcher/doc_analyzer/engine_executor/validator/skill_manager/document_processor/system_maintainer）
+        agent_name: 子代理名称（quick_helper/web_researcher/doc_analyzer/engine_executor/validator/skill_manager/document_processor/system_maintainer）
         task: 要委派给子代理的具体任务描述
     """
-    subagent_registry = _ctx_subagent_registry.get()
+    subagent_registry = _ctx_sub_reg.get()
     llm_ref = _ctx_llm_ref.get()
     
     if subagent_registry is None:
@@ -924,10 +1003,10 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
     if llm_ref is None:
         return "Error: LLM not initialized"
 
-    spec = subagent_registry.get(agent_type)  # 查询子代理规格
+    spec = subagent_registry.get(agent_name)  # 查询子代理规格
     if spec is None:
         available = ", ".join(subagent_registry.names())
-        return f"Error: unknown subagent '{agent_type}'. Available: {available}"
+        return f"Error: unknown subagent '{agent_name}'. Available: {available}"
 
     # 子代理的工具从白名单中筛选
     tools = [
@@ -936,7 +1015,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         if name in _SUBAGENT_TOOL_MAP
     ]
     if not tools:
-        return f"Error: no tools available for subagent '{agent_type}'"
+        return f"Error: no tools available for subagent '{agent_name}'"
 
     # 子代理有自己独立的 prompt 和 executor
     prompt = ChatPromptTemplate.from_messages([
@@ -955,7 +1034,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         verbose=False,
     )
 
-    print(f"\n[派遣子代理 · {agent_type}]: {task[:80]}")
+    print(f"\n[派遣子代理 · {agent_name}]: {task[:80]}")
 
     try:
         result = executor.invoke({
@@ -964,7 +1043,7 @@ def dispatch_subagent(agent_type: str, task: str) -> str:
         })
         final = result["output"]  # ← 只回传总结，子代理内部历史不暴露
     except Exception as exc:
-        return f"Error: subagent '{agent_type}' raised: {exc}"
+        return f"Error: subagent '{agent_name}' raised: {exc}"
 
     print(f"[子代理汇报]: {final[:200]}")
     return final
@@ -980,5 +1059,6 @@ _SUBAGENT_TOOL_MAP = {
     "glob": glob_tool,
     "grep": grep_tool,
     "load_skill": load_skill,
+    "rag_search": rag_search,
     # dispatch_subagent 不在其中，防止子代理递归派遣
 }

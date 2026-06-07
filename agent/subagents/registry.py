@@ -125,11 +125,13 @@ _BUILTIN_SPECS: dict[str, dict] = {
         "description": (
             "需求分析师。将客户模糊需求转化为结构化需求简报，"
             "识别核心功能、目标用户、约束条件和风险点。"
+            "支持 RAG 知识库检索，可查询历史需求模板和行业框架。"
         ),
         "tool_names": (
-            "read_file", "write_file", "grep",
+            "read_file", "write_file", "grep", "rag_search", "web_fetch",
         ),
-        "max_turns": 10,
+        "max_turns": 12,
+        "is_rag": True,
     },
     "product_manager": {
         "description": (
@@ -246,6 +248,7 @@ class SubagentRegistry:
                 system_prompt=system_prompt,
                 tool_names=tuple(cfg["tool_names"]),
                 max_turns=cfg["max_turns"],
+                is_rag=cfg.get("is_rag", False),
             )
 
     # 子代理结论格式后缀：要求子代理在回复末尾包含结构化结论，

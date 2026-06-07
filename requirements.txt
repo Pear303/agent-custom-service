@@ -24,6 +24,10 @@ aiosqlite>=0.20.0
 
 # 向量存储
 chromadb>=1.10.0
+langchain-chroma>=0.2.0
+
+# RAG: Embedding + Reranker
+sentence-transformers>=3.0
 
 # 测试
 pytest>=9.0

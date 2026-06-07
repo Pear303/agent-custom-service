@@ -14,7 +14,7 @@ from .session_manager import SessionManager, Session
 from ..clients.dify import DifyChatflowClient
 from ..core.config import settings
 from ..utils.file_manager import _clean_output_path
-from agent.factory import create_agent
+from agent.factory import create_lc_agent
 from agent.lc_tools import set_workspace, set_skills_loader, set_todo_store, set_subagent_deps, set_user_id, set_ticket_id, clear_context, _build_workspace
 
 # LangGraph Agent 支持（可选，需安装 langgraph-checkpoint-sqlite）
@@ -275,7 +275,7 @@ async def _invoke_lg_async(agent, prompt: str, output_subdir=None):
     - 若 checkpointer 不可用（未安装 langgraph-checkpoint-sqlite），则始终传完整上下文。
 
     Args:
-        agent: LangGraphAgent 实例
+        agent: LGAgent 实例
         prompt: 用户输入
         output_subdir: 非空时使用 _build 临时目录作为 workspace，
                        避免 LLM 的 write_file 与最终输出目录冲突导致路径嵌套。
@@ -417,7 +417,7 @@ async def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
     - decision="reject": 拒绝危险工具调用
 
     Args:
-        agent: LangGraphAgent 实例
+        agent: LGAgent 实例
         decision: 审批决定 ("approve" 或 "reject")
         thread_id: 被中断的线程 ID（用于恢复正确的 checkpoint）
 
@@ -565,7 +565,7 @@ class AgentService:
                 logger.debug("[引擎路由] 需求分析 → LangGraph | user_id=%s", user_id)
                 return await self._analyze_requirement_lg(user_id, requirement, ticket_id)
             logger.debug("[引擎路由] 需求分析 → LangChain | user_id=%s", user_id)
-            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            agent = create_lc_agent(user_id=user_id, ticket_id=ticket_id)
 
             prompt = f"""基于以下客户需求，按要求输出 JSON 格式的需求分析结果：
 
@@ -618,7 +618,7 @@ class AgentService:
                 logger.debug("[引擎路由] PRD设计 → LangGraph | user_id=%s", user_id)
                 return await self._design_prd_lg(user_id, analysis, ticket_id)
             logger.debug("[引擎路由] PRD设计 → LangChain | user_id=%s", user_id)
-            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            agent = create_lc_agent(user_id=user_id, ticket_id=ticket_id)
 
             prompt = f"""基于以下需求分析结果，按要求输出 JSON 格式的 PRD：
 
@@ -671,7 +671,7 @@ class AgentService:
                 logger.debug("[引擎路由] 成本估算 → LangGraph | user_id=%s", user_id)
                 return await self._estimate_cost_lg(user_id, prd, analysis, ticket_id)
             logger.debug("[引擎路由] 成本估算 → LangChain | user_id=%s", user_id)
-            agent = create_agent(user_id=user_id, ticket_id=ticket_id)
+            agent = create_lc_agent(user_id=user_id, ticket_id=ticket_id)
 
             combined = {**prd, **analysis}
             prompt = f"""基于以下 PRD 和需求分析，按要求输出 JSON 格式的成本估算：
@@ -785,7 +785,7 @@ class AgentService:
         logger.debug("[引擎路由] 项目开发 → LangChain | user_id=%s", user_id)
 
         async with _agent_semaphore:
-            agent = create_agent(user_id=user_id, ticket_id=ticket_id, max_iterations=80)
+            agent = create_lc_agent(user_id=user_id, ticket_id=ticket_id, max_iterations=80)
 
             prompt = f"""基于以下项目数据，按要求输出 JSON 格式的开发结果：
 

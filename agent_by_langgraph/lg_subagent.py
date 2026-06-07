@@ -129,17 +129,20 @@ def create_subagent_graph(llm, spec: SubagentSpec, checkpointer=None):
     return builder.compile(checkpointer=checkpointer)
 
 
-# 按 (model_name, agent_type) 区分的子图缓存
+# 按 (model_name, agent_name) 区分的子图缓存
 # 注意：缓存的是 CompiledGraph，持有对 LLM 与工具的强引用；
 # 长期运行的服务应在切换 LLM / 模型时调用 clear_subgraph_cache() 释放旧实例
 _subgraph_cache: dict[tuple[str, str], object] = {}
 
 
-def get_subagent_graph(llm, registry, agent_type: str, checkpointer=None):
+def get_subagent_graph(llm, registry, agent_name: str, checkpointer=None):
     """获取或创建缓存的子代理子图。
 
-    缓存 key: (model_name, agent_type) —— 相同模型 + 相同子代理类型复用子图，
+    缓存 key: (model_name, agent_name) —— 相同模型 + 相同子代理名称复用子图，
     不同模型则创建新子图（因为工具绑定与 LLM 实例相关）。
+
+    requirement_analyst 使用 CRAG 子图（lg_rag_subagent.py），
+    其他子代理使用普通子图。
 
     注意：checkpointer 只在首次创建时传入，缓存命中时忽略。
     这意味着所有同类型子代理共享同一个 checkpointer 实例，
@@ -148,25 +151,30 @@ def get_subagent_graph(llm, registry, agent_type: str, checkpointer=None):
     Args:
         llm: ChatModel 实例
         registry: SubagentRegistry
-        agent_type: 子代理名称
+        agent_name: 子代理名称
         checkpointer: 可选的 LangGraph Checkpointer
 
     Returns:
         CompiledGraph
 
     Raises:
-        ValueError: 未知 agent_type
+        ValueError: 未知 agent_name
     """
     model_name = getattr(llm, "model_name", "") or getattr(llm, "model", "") or "unknown"
-    key = (model_name, agent_type)
+    key = (model_name, agent_name)
     if key not in _subgraph_cache:
-        spec = registry.get(agent_type)
+        spec = registry.get(agent_name)
         if spec is None:
             available = ", ".join(registry.names())
             raise ValueError(
-                f"Unknown subagent '{agent_type}'. Available: {available}"
+                f"Unknown subagent '{agent_name}'. Available: {available}"
             )
-        _subgraph_cache[key] = create_subagent_graph(llm, spec, checkpointer=checkpointer)
+        # requirement_analyst 使用 CRAG 子图
+        if spec.is_rag:
+            from agent_by_langgraph.lg_rag_subagent import create_rag_subagent_graph
+            _subgraph_cache[key] = create_rag_subagent_graph(llm, spec, checkpointer=checkpointer)
+        else:
+            _subgraph_cache[key] = create_subagent_graph(llm, spec, checkpointer=checkpointer)
     return _subgraph_cache[key]
 
 

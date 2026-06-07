@@ -62,7 +62,7 @@ def _get_subagent_registry():
     return _subagent_registry_cache
 
 
-def create_agent(user_id: str, ticket_id: str | None = None, model: str = None, max_iterations: int = 50):
+def create_lc_agent(user_id: str, ticket_id: str | None = None, model: str = None, max_iterations: int = 50):
     """为指定用户创建独立的 LCAgent 实例。
     
     使用缓存的共享资源（LLM、SkillsLoader、SubagentRegistry），

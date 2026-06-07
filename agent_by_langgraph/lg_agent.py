@@ -92,7 +92,7 @@ class ReasoningCollector(BaseCallbackHandler):
         return self.ai_messages[-1] if self.ai_messages else None
 
 
-class LangGraphAgent:
+class LGAgent:
     """基于 LangGraph StateGraph 的智能代理类。
 
     功能等价于 LCAgent，使用 StateGraph + ToolNode 替代 AgentExecutor。
@@ -126,6 +126,7 @@ class LangGraphAgent:
 
         workspace = _build_workspace(self.root, user_id, ticket_id)
         set_workspace(workspace)
+        self._workspace = workspace  # D2: 保存工作目录引用，供外部查询
         if user_id:
             set_user_id(user_id)
         if ticket_id:
@@ -189,6 +190,18 @@ class LangGraphAgent:
         )
         system_prompt = ctx.build_system_prompt()
 
+        # D1: 注入当前工作目录信息，让 Agent 知道文件操作的根路径
+        # 避免 Agent 不知道 CWD 而反复搜索浪费 token
+        workspace = _build_workspace(self.root, user_id, ticket_id)
+        cwd_hint = (
+            f"\n\n---\n\n# Current Working Directory\n\n"
+            f"你的当前工作目录（CWD）是: `{workspace}`\n"
+            f"所有文件操作（read_file, write_file, edit_file）的路径都相对于此目录解析。\n"
+            f"例如：`read_file('src/app.py')` 实际读取 `{workspace}/src/app.py`。\n"
+            f"请始终使用相对于此目录的路径，不要使用绝对路径或猜测路径。"
+        )
+        system_prompt += cwd_hint
+
         # 初始化 LangGraph Checkpointer（SQLite 持久化）
         # 启用后支持：状态持久化、时间旅行调试、断点续跑
         checkpointer = self._init_checkpointer()
@@ -200,20 +213,49 @@ class LangGraphAgent:
         )
         self._system_prompt = system_prompt
 
+    @property
+    def will_have_checkpointer(self) -> bool:
+        """判断当前 Agent 是否将拥有（或已拥有）checkpointer。
+
+        统一判断逻辑，避免 run() 和 arun_stream() 中重复推断。
+        覆盖两种场景：
+        1. checkpointer 已初始化：graph.checkpointer is not None
+        2. checkpointer 延迟初始化：_checkpointer_db_path 存在但尚未初始化
+        """
+        return (
+            self.graph.checkpointer is not None
+            or getattr(self, '_checkpointer_db_path', None) is not None
+        )
+
     def close(self) -> None:
         """释放资源：关闭 Checkpointer 的 SQLite 连接。
 
         应在 agent 不再使用时调用（如 LRU 淘汰、会话结束），
         确保 SQLite 连接正确关闭，避免资源泄漏。
         """
-        self._close_checkpointer_ctx("_checkpointer_ctx", "主 Checkpointer")
+        try:
+            self._close_checkpointer_ctx("_checkpointer_ctx", "主 Checkpointer")
 
-        # 清理子代理 checkpointer 缓存
-        from agent_by_langgraph.lg_graph import _sub_checkpointer_cache, _sub_checkpointer_lock
-        with _sub_checkpointer_lock:
-            if self.user_id and self.user_id in _sub_checkpointer_cache:
-                sub_ctx, _ = _sub_checkpointer_cache.pop(self.user_id)
-                self._close_checkpointer_ctx_obj(sub_ctx, f"子代理 Checkpointer (user_id={self.user_id})")
+            # 清理子代理 checkpointer 缓存
+            from agent_by_langgraph.lg_graph import _sub_checkpointer_cache, _sub_checkpointer_lock
+            with _sub_checkpointer_lock:
+                if self.user_id and self.user_id in _sub_checkpointer_cache:
+                    sub_ctx, _ = _sub_checkpointer_cache.pop(self.user_id)
+                    self._close_checkpointer_ctx_obj(sub_ctx, f"子代理 Checkpointer (user_id={self.user_id})")
+        except (ImportError, AttributeError):
+            # Python 关闭期间 sys.meta_path 可能为 None，import 会失败；
+            # 属性可能已被 GC 回收。静默跳过即可。
+            pass
+
+    @property
+    def checkpointer_ready(self) -> bool:
+        """D3: Checkpointer 是否已初始化完成。
+
+        延迟初始化期间 graph.checkpointer 为 None，
+        但 _ensure_checkpointer 尚未被调用。
+        调用方应检查此属性而非直接检查 graph.checkpointer。
+        """
+        return getattr(self, '_checkpointer_initialized', False)
 
     @staticmethod
     def _close_checkpointer_ctx_obj(ctx, label: str) -> None:
@@ -288,6 +330,8 @@ class LangGraphAgent:
             logger.info("[Checkpointer] AsyncSqliteSaver 延迟初始化: %s", db_path)
             return None  # 延迟初始化，首次 ainvoke 时完成
         except ImportError:
+            self._checkpointer_initialized = False
+            self._checkpointer_db_path = None
             logger.warning(
                 "[Checkpointer] langgraph-checkpoint-sqlite 未安装，"
                 "状态持久化/时间旅行/断点续跑不可用。"
@@ -295,6 +339,8 @@ class LangGraphAgent:
             )
             return None
         except Exception as exc:
+            self._checkpointer_initialized = False
+            self._checkpointer_db_path = None
             logger.warning("[Checkpointer] 初始化失败: %s，checkpointer 降级为 None", exc)
             return None
 
@@ -328,10 +374,7 @@ class LangGraphAgent:
             all_callbacks.extend([self._reasoning_collector, stream_handler])
             # 注意：checkpointer 可能延迟初始化，此时 graph.checkpointer 为 None
             # 但 _checkpointer_db_path 存在，意味着 checkpointer 将在 ainvoke 前初始化
-            _will_have_checkpointer = (
-                self.graph.checkpointer is not None
-                or getattr(self, '_checkpointer_db_path', None) is not None
-            )
+            _will_have_checkpointer = self.will_have_checkpointer
             config: RunnableConfig = {
                 "callbacks": all_callbacks,
                 "recursion_limit": self.max_iterations * 4 + 10,
@@ -536,10 +579,7 @@ class LangGraphAgent:
         """
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        _will_have_checkpointer = (
-            self.graph.checkpointer is not None
-            or getattr(self, '_checkpointer_db_path', None) is not None
-        )
+        _will_have_checkpointer = self.will_have_checkpointer
         with self._invoke_lock:
             is_first_turn = self._first_turn
             if is_first_turn and _will_have_checkpointer:

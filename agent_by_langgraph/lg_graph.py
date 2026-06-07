@@ -26,11 +26,15 @@
 """
 from __future__ import annotations
 
-from collections import OrderedDict
-from operator import add
+import logging
+import os
 import re
 import threading
+from collections import OrderedDict
 from typing import Annotated, Sequence, TypedDict
+
+logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("agent.audit")
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -47,9 +51,14 @@ _DANGEROUS_TOOLS = frozenset({
 
 # ── 自适应工具分组（P3）────────────────────────────────────────
 # gather 阶段：只读工具，信息收集（核心限制：防止未收集信息就修改）
+# D5: 允许 run_command，因为只读命令（如 python test.py、ls）也是信息收集
+# 注：dispatch_subagent_lg 在 gather 阶段可用，但 LLM 应优先派遣只读子代理
+#     （SubagentSpec.read_only=True）。非只读子代理在 gather 阶段可能执行写操作，
+#     违反 gather 只读语义，但保留此工具以支持灵活的信息收集场景。
 _GATHER_TOOLS = frozenset({
     "read_file", "grep_tool", "glob_tool", "web_fetch",
     "load_skill", "dispatch_subagent_lg", "update_todos",
+    "run_command",
 })
 # modify 阶段：全量工具（修改时需要只读工具辅助参考，无限制必要）
 _MODIFY_TOOLS = frozenset({
@@ -79,17 +88,16 @@ def _replace_results(existing: list[str], new: list[str]) -> list[str]:
 
     约定：
     - new 非空 → 追加到 existing
-    - new == ["__CLEAR__"] → 清空（消费信号，由 aggregate_results 发出）
+    - new == ["__SUBAGENT_CLEAR__"] → 清空（消费信号，由 aggregate_results 发出）
     - new 为空列表 → 保持不变（LangGraph Send 合并时的默认行为）
 
     替代 operator.add：add reducer 无法清空列表，
     导致 aggregate_results 返回 [] 后 existing 仍保留旧值。
 
-    使用哨兵值 "__CLEAR__" 替代空列表清空语义，避免：
-    - 任何节点意外返回 subagent_results: [] 触发误清空
-    - LangGraph Send 合并时 reducer 被多次调用导致竞态
+    D10: 使用 "__SUBAGENT_CLEAR__" 替代 "__CLEAR__" 作为哨兵值，
+    降低与普通文本内容冲突的风险。
     """
-    if new == ["__CLEAR__"]:
+    if new == ["__SUBAGENT_CLEAR__"]:
         return []  # 清空信号：aggregate_results 消费后发出
     return existing + new
 
@@ -137,7 +145,7 @@ class SubagentWorkerState(TypedDict):
     每个 Send("subagent_worker", ...) 创建一个独立的 worker 实例，
     拥有自己的 state，不与主 AgentState 共享。
     """
-    agent_type: str
+    agent_name: str
     task: str
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
@@ -147,12 +155,20 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
 
     路由优先级：
     1. 无 tool_calls → END
-    2. 有 dispatch_subagent_lg 调用 → subagent_dispatcher（并行派遣）
+    2. 有 dispatch_subagent_lg 调用 → 直接返回 list[Send] 并行派遣
        - 混合调用时，非子代理的 tool_calls 暂存到 _pending_tool_calls，
          由 aggregate_results 恢复到消息流
     3. 有危险工具调用 → interrupt_approval（安全审批）
     4. 普通工具调用 → tools
+
+    注意：LangGraph 条件边函数支持返回 list[Send]，
+    但独立节点不允许。因此子代理派遣逻辑直接在此条件边中完成，
+    不再通过独立的 _subagent_dispatcher 节点中转。
     """
+
+    print(f"[路由] 最后消息类型: {type(state['messages'][-1]).__name__}, "
+          f"有 tool_calls? {bool(state['messages'][-1].tool_calls)}")
+
     last = state["messages"][-1]
 
     if not isinstance(last, AIMessage) or not last.tool_calls:
@@ -163,11 +179,21 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
     dangerous_calls = [tc for tc in last.tool_calls if tc["name"] in _DANGEROUS_TOOLS]
     normal_calls = [tc for tc in last.tool_calls if tc["name"] not in _DANGEROUS_TOOLS and tc["name"] != "dispatch_subagent_lg"]
 
-    # 子代理调用优先：走 subagent_dispatcher 并行派遣
+    # 子代理调用优先：直接返回 list[Send] 并行派遣
     if subagent_calls:
         # 混合调用：非子代理的 tool_calls 由 _advance_phase 暂存到 state._pending_tool_calls，
         # _aggregate_results 从 state 读取并恢复到消息流
-        return "subagent_dispatcher"
+        sends = []
+        for tc in subagent_calls:
+            sends.append(Send(
+                "subagent_worker",
+                {
+                    "agent_name": tc["args"]["agent_name"],
+                    "task": tc["args"]["task"],
+                    "messages": [],
+                },
+            ))
+        return sends
 
     # 危险工具：走 interrupt_approval 安全审批
     if dangerous_calls and not normal_calls:
@@ -180,34 +206,6 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
 
     # 普通工具调用
     return "tools"
-
-
-def _subagent_dispatcher(state: AgentState) -> list[Send]:
-    """将 LLM 发出的多个 dispatch_subagent_lg 调用转为并行 Send。
-
-    每个 Send 触发一个独立的 subagent_worker 节点实例，
-    在同一 superstep 内并行执行。
-
-    混合调用处理：当 LLM 同时发出子代理调用和普通/危险工具调用时，
-    非子代理的 tool_calls 由 _advance_phase 暂存到 state._pending_tool_calls，
-    由 _aggregate_results 在汇总后精确恢复到消息流。
-
-    注意：LangGraph 节点返回 list[Send] 时不能同时返回 state 更新，
-    因此通过 _advance_phase 节点暂存 pending tool_calls 到 state。
-    """
-    last = state["messages"][-1]
-    sends = []
-    for tc in last.tool_calls:
-        if tc["name"] == "dispatch_subagent_lg":
-            sends.append(Send(
-                "subagent_worker",
-                {
-                    "agent_type": tc["args"]["agent_type"],
-                    "task": tc["args"]["task"],
-                    "messages": [],
-                },
-            ))
-    return sends
 
 
 async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -> dict:
@@ -226,7 +224,7 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
     - 优先提取 ## 结论 段落，否则取最后 3 行
     - 输出结构化格式：类型、摘要、文件、结论
     """
-    from agent.lc_tools import _ctx_llm_ref, _ctx_subagent_registry, _ctx_user_id
+    from agent.lc_tools import _ctx_llm_ref, _ctx_sub_reg, _ctx_user_id
     from agent_by_langgraph.lg_subagent import get_subagent_graph
     from agent_by_langgraph.context_var_manager import snapshot as _ctx_snapshot, restore as _ctx_restore
 
@@ -234,27 +232,27 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
     ctx_snap = _ctx_snapshot()
 
     try:
-        registry = _ctx_subagent_registry.get()
+        registry = _ctx_sub_reg.get()
         llm = _ctx_llm_ref.get()
-        agent_type = state["agent_type"]
+        agent_name = state["agent_name"]
         task = state["task"]
 
         if registry is None:
-            return {"subagent_results": [f"[{agent_type}] Error: Subagent registry not initialized"]}
+            return {"subagent_results": [f"[{agent_name}] Error: Subagent registry not initialized"]}
         if llm is None:
-            return {"subagent_results": [f"[{agent_type}] Error: LLM not initialized"]}
+            return {"subagent_results": [f"[{agent_name}] Error: LLM not initialized"]}
 
-        spec = registry.get(agent_type)
+        spec = registry.get(agent_name)
         if spec is None:
             available = ", ".join(registry.names())
-            return {"subagent_results": [f"[{agent_type}] Error: unknown subagent. Available: {available}"]}
+            return {"subagent_results": [f"[{agent_name}] Error: unknown subagent. Available: {available}"]}
 
-        print(f"\n[LG 并行子代理 · {agent_type}]: {task[:80]}")
+        print(f"\n[LG 并行子代理 · {agent_name}]: {task[:80]}")
 
         # 构造子代理的 checkpointer 和隔离 thread_id
         import time
         user_id = _ctx_user_id.get() or "default"
-        sub_thread_id = f"{user_id}:sub:{agent_type}:{int(time.time() * 1000)}"
+        sub_thread_id = f"{user_id}:sub:{agent_name}:{int(time.time() * 1000)}"
 
         # 尝试从主图的 checkpointer 复用（同类型子代理共享 checkpointer 实例）
         # _subagent_worker 是 async 节点，已在事件循环中，
@@ -288,16 +286,25 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
             logger.warning("[SubCheckpointer] 初始化失败，降级为无状态执行: %s", exc)
 
         try:
-            subgraph = get_subagent_graph(llm, registry, agent_type, checkpointer=sub_checkpointer)
+            subgraph = get_subagent_graph(llm, registry, agent_name, checkpointer=sub_checkpointer)
             sub_config = {"configurable": {"thread_id": sub_thread_id}}
-            result = await subgraph.ainvoke({
+            # CRAG 子图需要额外的状态字段
+            sub_input = {
                 "input": task,
                 "turns_remaining": spec.max_turns,
                 "max_turns": spec.max_turns,
                 "messages": [],
-            }, config=sub_config)
+            }
+            if spec.is_rag:
+                sub_input.update({
+                    "rewritten_queries": [],
+                    "retrieved_docs": [],
+                    "rag_context": "",
+                    "needs_web_fallback": False,
+                })
+            result = await subgraph.ainvoke(sub_input, config=sub_config)
         except Exception as exc:
-            return {"subagent_results": [f"[{agent_type}] Error: {exc}"]}
+            return {"subagent_results": [f"[{agent_name}] Error: {exc}"]}
 
         # 提取最后一条 AIMessage 的文本
         last_text = ""
@@ -308,11 +315,11 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
                 break
 
         if not last_text:
-            return {"subagent_results": [f"[{agent_type}] [子代理未产出任何回复]"]}
+            return {"subagent_results": [f"[{agent_name}] [子代理未产出任何回复]"]}
 
         # 就地压缩：提取结论 + 结构化格式
-        compressed = _compress_subagent_result(last_text, agent_type=agent_type)
-        print(f"[LG 子代理汇报 · {agent_type}]: {compressed[:200]}")
+        compressed = _compress_subagent_result(last_text, agent_name=agent_name)
+        print(f"[LG 子代理汇报 · {agent_name}]: {compressed[:200]}")
         return {"subagent_results": [compressed]}
     finally:
         # 恢复 ContextVar，防止子代理内部修改影响其他并行 worker
@@ -355,16 +362,23 @@ def _aggregate_results(state: AgentState) -> dict:
         # 直接路由到 tools 节点执行 pending tool_calls，
         # 而非回到 agent 让 LLM 重新决策
         pending_route = "tools"
+        logger.info(
+            "[D4] 混合调用恢复: %d 个 pending tool_calls 将路由到 tools 节点",
+            len(pending_calls),
+        )
+    elif state.get("_pending_tool_calls"):
+        # D4 防御性检查：_pending_tool_calls 存在但为空列表，
+        # 不应路由到 tools（可能是上一轮残留的空列表）
+        logger.warning("[D4] _pending_tool_calls 为空列表，路由到 agent 而非 tools")
 
-    # 清空 subagent_results（通过哨兵值 "__CLEAR__" 触发 _replace_results 清空）
+    # 清空 subagent_results（通过哨兵值 "__SUBAGENT_CLEAR__" 触发 _replace_results 清空）
     # 同时清空 _pending_tool_calls（已消费）
     result = {
         "messages": new_messages,
-        "subagent_results": ["__CLEAR__"],
+        "subagent_results": ["__SUBAGENT_CLEAR__"],
         "_pending_route": pending_route,
+        "_pending_tool_calls": [],  # 始终清空，避免空列表残留导致下一轮误判
     }
-    if pending_calls:
-        result["_pending_tool_calls"] = []  # 消费后清空
     return result
 
 
@@ -383,12 +397,12 @@ _MAX_CONCLUSION_CHARS = 1200
 def _compress_subagent_result(
     result: str,
     max_chars: int = _MAX_SUBAGENT_CHARS,
-    agent_type: str = "",
+    agent_name: str = "",
 ) -> str:
     """压缩子代理结果为结构化格式。
 
     输出格式：
-        [子代理类型] 摘要(≤50字)
+        [子代理名称] 摘要(≤50字)
         - 涉及文件: file1.py:10, file2.ts:42
         - 结论: ...
 
@@ -398,7 +412,7 @@ def _compress_subagent_result(
     3. 退化为取最后 3 行作为结论
     4. 附加文件路径（含行号）
     """
-    prefix = f"[{agent_type}] " if agent_type else ""
+    prefix = f"[{agent_name}] " if agent_name else ""
 
     # 短结果直接返回
     if len(result) <= max_chars:
@@ -562,7 +576,9 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
 
     planning_input = _PLANNER_PROMPT.format(request=user_request)
     try:
-        response = await llm.ainvoke(
+        # 显式绑定空工具列表，确保 planner 不产生 tool_calls
+        planner_llm = llm.bind_tools([])
+        response = await planner_llm.ainvoke(
             [HumanMessage(content=planning_input)],
             config=config,
         )
@@ -671,11 +687,14 @@ def _advance_phase(state: AgentState) -> dict:
         return {"_phase": phase, "_stall_count": stall_count}
 
     # 检测 agent 是否调用了写工具
+    # D5: run_command 在 gather 阶段允许用于信息收集（如运行测试），
+    # 不应触发 gather→modify 推进。只有 write_file/edit_file 才是真正的修改。
+    _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
     has_modify_calls = bool(last.tool_calls) and any(
-        tc["name"] in _DANGEROUS_TOOLS for tc in last.tool_calls
+        tc["name"] in _WRITE_TOOLS for tc in last.tool_calls
     )
 
-    # 检测 agent 是否调用了只读工具（非写工具）
+    # 检测 agent 是否调用了只读工具（非写工具，含 run_command）
     has_read_only_calls = bool(last.tool_calls) and not has_modify_calls
 
     # 检测 agent 是否返回文本（无 tool_calls）
@@ -771,10 +790,31 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
     has_checkpointer = config.get("configurable", {}).get("__has_checkpointer__", False)
 
     if not has_checkpointer:
-        # 无 checkpointer：interrupt() 无法工作，自动放行并记录警告
+        # 无 checkpointer：interrupt() 无法工作
         tool_names = ", ".join(tc["name"] for tc in dangerous_calls)
-        print(f"[警告] 无 checkpointer，危险工具自动放行: {tool_names}")
-        return {"messages": [], "_approval_next": "tools"}
+        auto_approve = os.environ.get("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true").lower() in ("true", "1", "yes")
+        if auto_approve:
+            logger.warning(
+                "[D7] 无 checkpointer，危险工具自动放行: %s。"
+                "启用 checkpointer 可获得安全审批能力。"
+                "设置 AUTO_APPROVE_WITHOUT_CHECKPOINTER=false 可改为拒绝。",
+                tool_names,
+            )
+            # 结构化审计日志：记录自动放行的详细信息，便于事后追溯
+            audit_logger.warning(
+                "AUTO_APPROVE | tools=%s | reason=no_checkpointer | args_summary=%s",
+                tool_names,
+                {tc["name"]: str(tc.get("args", ""))[:100] for tc in dangerous_calls},
+            )
+            return {"messages": [], "_approval_next": "tools"}
+        else:
+            logger.error(
+                "[D7] 无 checkpointer 且 AUTO_APPROVE_WITHOUT_CHECKPOINTER=false，"
+                "拒绝危险工具调用: %s",
+                tool_names,
+            )
+            reject_msg = HumanMessage(content=f"[安全拒绝] 无 checkpointer，危险工具调用被拒绝: {tool_names}。请启用 checkpointer 或设置 AUTO_APPROVE_WITHOUT_CHECKPOINTER=true。")
+            return {"messages": [reject_msg], "_approval_next": "agent"}
 
     # 构建审批请求
     approval_request = {
@@ -790,10 +830,18 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
 
     if decision == "approve":
         # 放行：tools 节点会正常执行这些 tool_calls
+        audit_logger.info(
+            "APPROVED | tools=%s | decision=approve",
+            ", ".join(tc["name"] for tc in dangerous_calls),
+        )
         return {"messages": [], "_approval_next": "tools"}
     else:
         # 拒绝：注入拒绝消息，并回退 phase 到 gather（审批拒绝说明不应修改）
         tool_names = ", ".join(tc["name"] for tc in dangerous_calls)
+        audit_logger.warning(
+            "REJECTED | tools=%s | decision=reject",
+            tool_names,
+        )
         reject_msg = AIMessage(
             content=f"[人工审批] 以下操作已被拒绝: {tool_names}"
         )
@@ -893,7 +941,6 @@ def create_agent_graph(
     builder.add_node("agent", call_agent)
     builder.add_node("advance_phase", _advance_phase)
     builder.add_node("tools", tool_node)
-    builder.add_node("subagent_dispatcher", _subagent_dispatcher)
     builder.add_node("subagent_worker", _subagent_worker)
     builder.add_node("aggregate_results", _aggregate_results)
     builder.add_node("interrupt_approval", _interrupt_approval)

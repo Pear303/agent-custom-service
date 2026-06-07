@@ -14,10 +14,10 @@ from agent.skills import SkillsLoader
 from agent.telemetry import TokenTracker
 from agent.todo import TodoStore
 from agent_by_langgraph.factory import create_lg_agent
-from agent_by_langgraph.lg_agent import LangGraphAgent
+from agent_by_langgraph.lg_agent import LGAgent
 
 __all__ = [
-    "LangGraphAgent",
+    "LGAgent",
     "create_lg_agent",
     "MemoryStore",
     "ContextBuilder",

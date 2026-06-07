@@ -36,6 +36,7 @@ _READ_ONLY_TOOLS = frozenset({
     "glob_tool",
     "grep_tool",
     "load_skill",
+    "rag_search",
 })
 
 
@@ -134,8 +135,15 @@ class ParallelToolNode:
                         name=tc["name"],
                     )
                 except Exception as exc:
+                    # D6: 捕获参数校验等错误，返回友好提示让 LLM 纠正
+                    error_msg = str(exc)
+                    if "validation error" in error_msg.lower() or "field required" in error_msg.lower():
+                        error_msg = (
+                            f"工具调用参数错误: {error_msg}\n"
+                            f"请检查参数是否完整后重试。"
+                        )
                     return ToolMessage(
-                        content=f"Error: {exc}",
+                        content=f"Error: {error_msg}",
                         tool_call_id=tc["id"],
                         name=tc["name"],
                         status="error",
@@ -230,8 +238,15 @@ class ParallelToolNode:
                         name=tc["name"],
                     )
                 except Exception as exc:
+                    # D6: 捕获参数校验等错误，返回友好提示让 LLM 纠正
+                    error_msg = str(exc)
+                    if "validation error" in error_msg.lower() or "field required" in error_msg.lower():
+                        error_msg = (
+                            f"工具调用参数错误: {error_msg}\n"
+                            f"请检查参数是否完整后重试。"
+                        )
                     return ToolMessage(
-                        content=f"Error: {exc}",
+                        content=f"Error: {error_msg}",
                         tool_call_id=tc["id"],
                         name=tc["name"],
                         status="error",

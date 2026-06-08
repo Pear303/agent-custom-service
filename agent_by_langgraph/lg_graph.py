@@ -166,6 +166,7 @@ class AgentState(TypedDict):
     _phase: str
     _stall_count: int
     _pending_tool_calls: list[dict]
+    _compaction_summary: str
 
 
 class SubagentWorkerState(TypedDict):
@@ -209,6 +210,15 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
     dangerous_calls = [tc for tc in last.tool_calls if tc["name"] in _DANGEROUS_TOOLS]
     normal_calls = [tc for tc in last.tool_calls if tc["name"] not in _DANGEROUS_TOOLS and tc["name"] != "dispatch_subagent_lg"]
 
+    # T2 优化：只有 update_todos 调用时，走轻量内联节点，跳过 tools 节点的完整循环
+    todos_only_calls = [tc for tc in last.tool_calls if tc["name"] == "update_todos"]
+    other_normal_calls = [tc for tc in normal_calls if tc["name"] != "update_todos"]
+    if (todos_only_calls
+        and not other_normal_calls
+        and not dangerous_calls
+        and not subagent_calls):
+        return "todos_inline"
+
     # 子代理调用优先：直接返回 list[Send] 并行派遣
     if subagent_calls:
         # 混合调用：非子代理的 tool_calls 由 _advance_phase 暂存到 state._pending_tool_calls，
@@ -250,6 +260,43 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
 
     # 普通工具调用
     return "tools"
+
+
+async def _todos_inline(state: AgentState, config: RunnableConfig) -> dict:
+    """轻量内联执行 update_todos，跳过 tools 节点的完整循环。
+
+    T2 优化：update_todos 是纯本地操作（更新 TodoStore），
+    无需经过 ParallelToolNode 的完整工具执行流程。
+    直接调用工具函数，返回 ToolMessage，然后回到 agent 继续推理。
+
+    这避免了：tools 节点 → agent 节点 的完整往返（含消息历史重传），
+    将 update_todos 的执行合并到当前步中。
+    """
+    last = state["messages"][-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return {"messages": []}
+
+    from agent.lc_tools import update_todos as _update_todos_fn
+    results = []
+    for tc in last.tool_calls:
+        if tc["name"] != "update_todos":
+            continue
+        try:
+            observation = await _update_todos_fn.ainvoke(tc["args"])
+            results.append(ToolMessage(
+                content=str(observation),
+                tool_call_id=tc["id"],
+                name="update_todos",
+            ))
+        except Exception as exc:
+            results.append(ToolMessage(
+                content=f"Error: {exc}",
+                tool_call_id=tc["id"],
+                name="update_todos",
+                status="error",
+            ))
+
+    return {"messages": results}
 
 
 async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -> dict:
@@ -1004,37 +1051,100 @@ def create_agent_graph(
     # 上下文视图裁剪器：在注入 LLM 前裁剪消息，state 保持完整
     from agent.context_view import ContextView
     from agent.in_context_compactor import InContextCompactor
+    from agent.decision_summary import DecisionSummaryExtractor, merge_summaries
+    from agent.observation_masker import ObservationMasker
     _context_view = ContextView()
     _in_context_compactor = InContextCompactor()
+    _summary_extractor = DecisionSummaryExtractor()
+    _observation_masker = ObservationMasker()
+
+    def _inject_system_messages(
+        view: list[BaseMessage],
+        injections: list[tuple[int, SystemMessage]],
+    ) -> list[BaseMessage]:
+        """按优先级注入 SystemMessage。
+
+        Args:
+            view: 当前消息列表
+            injections: [(priority, SystemMessage)] 列表，
+                priority 越小越靠前（越接近第一条 SystemMessage）
+
+        优先级约定：
+            10 = 决策摘要（最基础，始终存在）
+            20 = 执行计划（指导当前任务）
+            30 = 批量调用提示（效率优化，可忽略）
+        """
+        if not injections:
+            return view
+        sorted_msgs = [msg for _, msg in sorted(injections, key=lambda x: x[0])]
+        if view and isinstance(view[0], SystemMessage):
+            return [view[0]] + sorted_msgs + view[1:]
+        return sorted_msgs + view
 
     async def call_agent(state: AgentState, config: RunnableConfig) -> dict:
         # 构建裁剪视图：LLM 只看到裁剪后的消息，state 保持完整
         # 这样 Checkpointer 保存完整序列，interrupt 恢复时状态一致
         full_messages = state["messages"]
-        # 步骤1: ContextView 裁剪 — 决定哪些消息保留
-        view = _context_view.build_view(list(full_messages))
-        # 步骤2: InContextCompactor 压缩 — 截断旧的大体积 ToolMessage
-        view = _in_context_compactor.compact(view)
 
-        # 步骤3: 注入执行计划（Plan-then-Execute）
+        # 步骤1: ContextView 裁剪 — 决定哪些消息保留 + 收集被裁剪组
+        view, pruned_groups = _context_view.build_view(list(full_messages))
+
+        # 步骤2: 决策摘要注入 — 从被裁剪组提取关键信息（T3）
+        new_summary = ""
+        if pruned_groups:
+            new_summary = _summary_extractor.extract(pruned_groups)
+
+        # 合并新旧摘要（跨压缩保持决策链）
+        old_summary = state.get("_compaction_summary", "")
+        if new_summary and old_summary:
+            merged = merge_summaries(old_summary, new_summary)
+        elif new_summary:
+            merged = new_summary
+        else:
+            merged = old_summary
+
+        # 收集待注入的 SystemMessage（按优先级排序，一次性注入）
+        injections: list[tuple[int, SystemMessage]] = []
+
+        # 优先级 10: 决策摘要
+        if merged:
+            injections.append((10, SystemMessage(content=merged)))
+
+        # 优先级 20: 执行计划
         plan = state.get("plan", "")
         if plan and plan != "无需规划":
-            plan_msg = SystemMessage(
+            injections.append((20, SystemMessage(
                 content=f"[执行计划]\n{plan}\n\n请按计划逐步执行。"
-            )
-            # 插入到第一条 SystemMessage 之后
-            if view and isinstance(view[0], SystemMessage):
-                view = [view[0], plan_msg] + view[1:]
-            else:
-                view = [plan_msg] + view
+            )))
 
-        # 步骤4: 自适应工具选择（P3）— 根据 _phase 过滤工具
+        # 优先级 30: 批量调用提示
         phase = state.get("_phase", "gather")
         stall_count = state.get("_stall_count", 0)
+        if phase in ("modify", "verify") and len(view) > 10:
+            injections.append((30, SystemMessage(
+                content="[效率提示] 如果需要连续修改多个文件或执行多个操作，"
+                "请在同一轮中批量发出所有 tool_calls，而非逐个调用。"
+                "例如：同时发出多个 edit_file 调用，而非每次只发一个。"
+            )))
+
+        view = _inject_system_messages(view, injections)
+
+        # 步骤3: 观察遮蔽 — 对只读工具的大体积输出做结构保留式压缩（T3）
+        view = _observation_masker.mask(view)
+
+        # 步骤4: InContextCompactor 压缩 — 截断旧的大体积 ToolMessage
+        view = _in_context_compactor.compact(view)
+
+        # 步骤5: 自适应工具选择（P3）— 根据 _phase 过滤工具
         llm_bound = _bind_tools_for_phase(llm, tools, llm_with_tools, phase, stall_count)
 
         response = await llm_bound.ainvoke(view, config=config)
-        return {"messages": [response]}
+
+        # 返回摘要到 state（跨压缩保持）
+        updates: dict = {"messages": [response]}
+        if merged != old_summary:
+            updates["_compaction_summary"] = merged
+        return updates
 
     builder = StateGraph(AgentState)
 
@@ -1043,6 +1153,7 @@ def create_agent_graph(
     builder.add_node("agent", call_agent)
     builder.add_node("advance_phase", _advance_phase)
     builder.add_node("tools", tool_node)
+    builder.add_node("todos_inline", _todos_inline)
     builder.add_node("subagent_worker", _subagent_worker)
     builder.add_node("aggregate_results", _aggregate_results)
     builder.add_node("interrupt_approval", _interrupt_approval)
@@ -1055,6 +1166,7 @@ def create_agent_graph(
     builder.add_edge("agent", "advance_phase")
     builder.add_conditional_edges("advance_phase", _route_after_agent)
     builder.add_edge("tools", "agent")
+    builder.add_edge("todos_inline", "agent")
     builder.add_edge("subagent_worker", "aggregate_results")
     builder.add_conditional_edges("aggregate_results", _route_after_aggregate)
     builder.add_conditional_edges("interrupt_approval", _route_after_approval)

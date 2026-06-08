@@ -301,6 +301,42 @@ class TestRouteAfterAgentMixed(unittest.TestCase):
         result = _route_after_agent(state)
         self.assertEqual(result, "tools")
 
+    def test_pure_update_todos_routes_to_todos_inline(self):
+        """只有 update_todos 调用时路由到 todos_inline（T2 优化）。"""
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[_make_tool_call("update_todos", {"todos": "[]"})],
+        )
+        state = _make_state(messages=[ai_msg])
+        result = _route_after_agent(state)
+        self.assertEqual(result, "todos_inline")
+
+    def test_update_todos_with_normal_tools_routes_to_tools(self):
+        """update_todos + 普通工具混合时路由到 tools（不走内联）。"""
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                _make_tool_call("update_todos", {"todos": "[]"}),
+                _make_tool_call("read_file", {"path": "a.py"}),
+            ],
+        )
+        state = _make_state(messages=[ai_msg])
+        result = _route_after_agent(state)
+        self.assertEqual(result, "tools")
+
+    def test_update_todos_with_dangerous_tools_routes_to_interrupt(self):
+        """update_todos + 危险工具混合时路由到 interrupt_approval。"""
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                _make_tool_call("update_todos", {"todos": "[]"}),
+                _make_tool_call("edit_file", {"path": "a.py", "replacements": []}),
+            ],
+        )
+        state = _make_state(messages=[ai_msg])
+        result = _route_after_agent(state)
+        self.assertEqual(result, "interrupt_approval")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

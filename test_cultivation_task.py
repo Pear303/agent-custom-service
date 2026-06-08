@@ -31,6 +31,7 @@ from pathlib import Path
 
 # Windows 编码修复
 if sys.platform == "win32":
+    os.system('chcp 65001 >nul 2>&1')
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -232,7 +233,7 @@ async def run_test():
     # 构造输入
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    has_checkpointer = agent.graph.checkpointer is not None
+    has_checkpointer = agent.will_have_checkpointer
     is_first_turn = agent._first_turn
 
     if is_first_turn or not has_checkpointer:
@@ -257,7 +258,7 @@ async def run_test():
 
     # 延迟初始化 checkpointer（确保在正确的事件循环中）
     await agent._ensure_checkpointer()
-    has_checkpointer = agent.graph.checkpointer is not None
+    has_checkpointer = agent.checkpointer_ready
 
     config: RunnableConfig = {
         "callbacks": all_callbacks,

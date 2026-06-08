@@ -38,6 +38,7 @@ from typing import Any
 
 # Windows 编码修复（必须在 logging.basicConfig 之前，否则 handler 使用旧编码）
 if sys.platform == "win32":
+    os.system('chcp 65001 >nul 2>&1')
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")

@@ -41,6 +41,7 @@ from typing import Any
 
 # Windows 编码修复
 if sys.platform == "win32":
+    os.system('chcp 65001 >nul 2>&1')
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -282,7 +283,9 @@ async def _call_lg_agent_with_events(prompt: str, user_id: str, ticket_id: str,
 
     # 本次测试：启用 checkpointer 以观察 interrupt 行为
     # 延迟初始化将在 _ensure_checkpointer 中完成
-    has_checkpointer = agent.graph.checkpointer is not None
+    # 使用 will_have_checkpointer 而非 graph.checkpointer is not None，
+    # 因为延迟初始化期间 graph.checkpointer 为 None 但 checkpointer 将被创建
+    has_checkpointer = agent.will_have_checkpointer
     logger.info("[Agent] checkpointer 初始状态: %s, _checkpointer_db_path: %s",
                 has_checkpointer, getattr(agent, '_checkpointer_db_path', None))
 
@@ -316,7 +319,7 @@ async def _call_lg_agent_with_events(prompt: str, user_id: str, ticket_id: str,
 
     # 延迟初始化 checkpointer
     await agent._ensure_checkpointer()
-    has_checkpointer = agent.graph.checkpointer is not None
+    has_checkpointer = agent.checkpointer_ready
     logger.info("[Agent] checkpointer 初始化后: %s", has_checkpointer)
 
     config: RunnableConfig = {

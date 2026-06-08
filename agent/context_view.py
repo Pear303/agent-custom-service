@@ -8,10 +8,26 @@ State 和 Checkpointer 始终保持完整消息序列，视图只是临时过滤
 2. 工具调用组原子性 — AIMessage(tool_calls) + ToolMessage 作为整体
 3. reasoning_content 不可触碰 — 含 DeepSeek reasoning_content 的消息不可裁剪
 4. 动态窗口 — 保留窗口大小基于 token 估算动态调整
+
+T3 增强：build_view 返回 (view, pruned_groups) 元组，
+pruned_groups 包含被裁剪掉的工具调用组信息，供 DecisionSummaryExtractor 生成决策摘要。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Sequence
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+
+
+@dataclass
+class PrunedToolCallGroup:
+    """被裁剪掉的工具调用组，供决策摘要提取。"""
+
+    group_index: int
+    ai_message: BaseMessage | None = None
+    tool_calls: list[dict] = field(default_factory=list)
+    tool_results: list[BaseMessage] = field(default_factory=list)
 
 
 def _has_reasoning(msg: BaseMessage) -> bool:
@@ -177,28 +193,36 @@ class ContextView:
         self.min_window = min_window
         self.keep_recent_groups = keep_recent_groups
 
-    def build_view(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+    def build_view(
+        self, messages: list[BaseMessage]
+    ) -> tuple[list[BaseMessage], list[PrunedToolCallGroup]]:
         """构建裁剪后的消息视图。
 
         Args:
             messages: state["messages"] 的完整消息序列
 
         Returns:
-            裁剪后的消息列表，可直接传给 LLM
+            (view, pruned_groups) 元组：
+            - view: 裁剪后的消息列表，可直接传给 LLM
+            - pruned_groups: 被裁剪掉的工具调用组列表，供决策摘要提取
         """
         if not messages:
-            return messages
+            return messages, []
 
         # 快速检查：如果总 token 未超阈值，直接返回
         total_tokens = sum(_msg_tokens(m) for m in messages)
         threshold = self.max_context_tokens * self.target_ratio
         if total_tokens <= threshold:
-            return messages
+            return messages, []
 
         # 需要裁剪 — 构建保留计划
         must_keep = self._compute_must_keep(messages)
-        view = self._build_with_budget(messages, must_keep, threshold)
-        return view
+        view, kept_indices = self._build_with_budget(messages, must_keep, threshold)
+
+        # 提取被裁剪的工具调用组信息
+        pruned_groups = self._collect_pruned_groups(messages, kept_indices)
+
+        return view, pruned_groups
 
     def _compute_must_keep(self, messages: list[BaseMessage]) -> set[int]:
         """计算必须保留的消息索引集合。"""
@@ -243,20 +267,26 @@ class ContextView:
         messages: list[BaseMessage],
         must_keep: set[int],
         token_budget: int,
-    ) -> list[BaseMessage]:
+    ) -> tuple[list[BaseMessage], set[int]]:
         """在 token 预算内构建消息视图。
 
         策略：
         1. 先加入所有 must_keep 消息
         2. 从尾部向前填充最近的消息，直到预算用完
         3. 确保工具调用组的原子性（不拆组）
+
+        Returns:
+            (view, kept_indices) 元组：
+            - view: 裁剪后的消息列表
+            - kept_indices: 保留的消息索引集合
         """
         # 计算必须保留消息的 token 消耗
         must_keep_tokens = sum(_msg_tokens(messages[i]) for i in must_keep)
 
         # 如果必须保留的消息已超预算，全部返回（无法裁剪）
         if must_keep_tokens >= token_budget:
-            return [messages[i] for i in sorted(must_keep)]
+            kept = must_keep
+            return [messages[i] for i in sorted(kept)], kept
 
         remaining_budget = token_budget - must_keep_tokens
         idx_to_group = _build_index_to_group(messages)
@@ -323,4 +353,47 @@ class ContextView:
         # 否则 LLM API 会报 "insufficient tool messages" 错误
         result = _ensure_tool_call_integrity(result)
 
-        return result
+        return result, kept
+
+    def _collect_pruned_groups(
+        self,
+        messages: list[BaseMessage],
+        kept_indices: set[int],
+    ) -> list[PrunedToolCallGroup]:
+        """从被裁剪的消息中收集工具调用组信息。
+
+        Args:
+            messages: 原始完整消息序列
+            kept_indices: 保留的消息索引集合
+
+        Returns:
+            被裁剪掉的工具调用组列表
+        """
+        groups = _build_tool_call_groups(messages)
+        pruned: list[PrunedToolCallGroup] = []
+
+        for gi, group in enumerate(groups):
+            # 只收集整组都被裁剪的工具调用组（部分裁剪的组信息不完整，不收集）
+            if group & kept_indices:
+                continue
+
+            ai_msg = None
+            tool_calls = []
+            tool_results = []
+
+            for idx in sorted(group):
+                msg = messages[idx]
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    ai_msg = msg
+                    tool_calls = list(msg.tool_calls)
+                elif isinstance(msg, ToolMessage):
+                    tool_results.append(msg)
+
+            pruned.append(PrunedToolCallGroup(
+                group_index=gi,
+                ai_message=ai_msg,
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            ))
+
+        return pruned

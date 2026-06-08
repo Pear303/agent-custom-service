@@ -311,11 +311,11 @@ async def _invoke_lg_async_inner(agent, prompt: str):
     from agent_by_langgraph.lg_agent import ReasoningCollector
 
     logger.debug(
-        "[LangGraph 执行] user_id=%s, first_turn=%s, checkpointer=%s",
-        agent.user_id, agent._first_turn, agent.graph.checkpointer is not None,
+        "[LangGraph 执行] user_id=%s, first_turn=%s, will_have_checkpointer=%s",
+        agent.user_id, agent._first_turn, agent.will_have_checkpointer,
     )
 
-    has_checkpointer = agent.graph.checkpointer is not None
+    has_checkpointer = agent.will_have_checkpointer
     async with agent._async_invoke_lock:
         is_first_turn = agent._first_turn
         if is_first_turn and has_checkpointer:
@@ -350,7 +350,7 @@ async def _invoke_lg_async_inner(agent, prompt: str):
         "recursion_limit": agent.max_iterations * 2 + 5,
         "configurable": {
             "thread_id": agent.user_id or "default",
-            "__has_checkpointer__": getattr(agent.graph, '_lg_has_checkpointer', agent.graph.checkpointer is not None),
+            "__has_checkpointer__": agent.will_have_checkpointer,
         },
     }
     try:

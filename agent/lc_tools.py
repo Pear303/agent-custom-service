@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import urllib.request
 from contextvars import ContextVar
 from html.parser import HTMLParser
@@ -673,10 +674,17 @@ def run_command(command: str) -> str:
             f"这些工具会自动处理路径解析和工作区约束。"
         )
 
+    # Windows 下设置子进程使用 UTF-8 输出，避免中文乱码
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+
     result = subprocess.run(
         command, shell=True, capture_output=True,
         encoding="utf-8", errors="replace",
         cwd=cwd,
+        env=env,
     )
     output = result.stdout or result.stderr
 

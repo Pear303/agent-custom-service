@@ -18,7 +18,7 @@ def _init_registry():
     """延迟初始化注册表，避免循环导入。"""
     if _CONTEXT_VARS:
         return
-    from agent.lc_tools import (
+    from agent_core.tools import (
         _ctx_workspace,
         _ctx_skills_loader,
         _ctx_todo_store,

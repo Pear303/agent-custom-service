@@ -11,7 +11,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from agent.lc_tools import (
+from agent_core.tools import (
     edit_file,
     glob_tool,
     grep_tool,
@@ -29,7 +29,7 @@ from agent.lc_tools import (
     write_file,
     _build_workspace,
 )
-from agent.rag.retriever import rag_search
+from agent_core.rag.retriever import rag_search
 
 
 def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
@@ -117,7 +117,7 @@ def dispatch_subagent_lg(agent_name: str, task: str) -> str:
         "请检查路由逻辑是否正常。",
         stacklevel=2,
     )
-    from agent.lc_tools import _ctx_llm_ref, _ctx_sub_reg
+    from agent_core.tools import _ctx_llm_ref, _ctx_sub_reg
     from agent_by_langgraph.lg_subagent import get_subagent_graph
 
     registry = _ctx_sub_reg.get()

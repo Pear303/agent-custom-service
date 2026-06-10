@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal enabledelayedexpansion
 chcp 65001 >nul
 
@@ -24,18 +24,18 @@ if errorlevel 1 (
 )
 
 REM -- Mode detection --------------------------------------------
-REM 默认开发模式（前后端同时启动 + 打开浏览器）
-REM 设 PROD_MODE=true 则只启动后端（生产模式）
+REM 榛樿寮€鍙戞ā寮忥紙鍓嶅悗绔悓鏃跺惎鍔?+ 鎵撳紑娴忚鍣級
+REM 璁?PROD_MODE=true 鍒欏彧鍚姩鍚庣锛堢敓浜фā寮忥級
 if "%PROD_MODE%"=="1"   set PROD_MODE=true
 if "%PROD_MODE%"=="yes" set PROD_MODE=true
 if /i "%PROD_MODE%"=="true" (goto :prod_mode) else (goto :dev_mode)
 
 :dev_mode
 echo.
-echo   [DEV MODE] 正在启动前后端服务...
+echo   [DEV MODE] 姝ｅ湪鍚姩鍓嶅悗绔湇鍔?..
 echo.
 
-REM -- 确保 npm 依赖已安装 ------------------------------------
+REM -- 纭繚 npm 渚濊禆宸插畨瑁?------------------------------------
 if not exist "frontend\node_modules" (
     echo [..] npm install...
     cd frontend
@@ -43,32 +43,31 @@ if not exist "frontend\node_modules" (
     cd ..
 )
 
-REM -- 启动 Vite 前端（新窗口） ----------------------------------
-echo [..] 启动前端 Vite (http://localhost:5173)...
+REM -- 鍚姩 Vite 鍓嶇锛堟柊绐楀彛锛?----------------------------------
+echo [..] 鍚姩鍓嶇 Vite (http://localhost:5173)...
 start "SmartCS Frontend" cmd /c "cd /d %~dp0frontend && npm run dev"
 
-REM -- 等待一下让 Vite 先起来 ------------------------------------
+REM -- 绛夊緟涓€涓嬭 Vite 鍏堣捣鏉?------------------------------------
 timeout /t 3 /nobreak >nul
 
-REM -- 启动后端（新窗口） ----------------------------------------
-echo [..] 启动后端 API (http://localhost:8080)...
-start "SmartCS Backend" cmd /c "cd /d %~dp0 && %PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent --no-access-log"
+REM -- 鍚姩鍚庣锛堟柊绐楀彛锛?----------------------------------------
+echo [..] 鍚姩鍚庣 API (http://localhost:8080)...
+start "SmartCS Backend" cmd /c "cd /d %~dp0 && %PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent_by_langgraph --reload-dir=agent_core --no-access-log"
 
-REM -- 打开浏览器 -------------------------------------------------
+REM -- 鎵撳紑娴忚鍣?-------------------------------------------------
 timeout /t 2 /nobreak >nul
-echo [OK] 正在打开浏览器...
+echo [OK] 姝ｅ湪鎵撳紑娴忚鍣?..
 start http://localhost:5173
 
 echo.
 echo =========================================
-echo   服务正在启动，请稍候...
+echo   鏈嶅姟姝ｅ湪鍚姩锛岃绋嶅€?..
 echo.
-echo   前端页面 : http://localhost:5173
-echo   后端 API  : http://localhost:8080
-echo   API 文档  : http://localhost:8080/docs
+echo   鍓嶇椤甸潰 : http://localhost:5173
+echo   鍚庣 API  : http://localhost:8080
+echo   API 鏂囨。  : http://localhost:8080/docs
 echo.
-echo   关闭前端/后端窗口即可停止服务。
-echo =========================================
+echo   鍏抽棴鍓嶇/鍚庣绐楀彛鍗冲彲鍋滄鏈嶅姟銆?echo =========================================
 echo.
 goto :eof
 
@@ -109,6 +108,6 @@ echo =========================================
 echo.
 
 :start
-%PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent --no-access-log
+%PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent_by_langgraph --reload-dir=agent_core --no-access-log
 
 pause

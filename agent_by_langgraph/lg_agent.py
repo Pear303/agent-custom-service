@@ -24,10 +24,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from openai import OpenAI as OpenAIClient
 
-from agent.compactor import Compactor
-from agent.context import ContextBuilder
-from agent.lc_agent import DeepSeekChatOpenAI, create_deepseek_llm
-from agent.lc_tools import (
+from agent_core.compactor import Compactor
+from agent_core.context import ContextBuilder
+from agent_core.llm import DeepSeekChatOpenAI, create_deepseek_llm
+from agent_core.tools import (
     _build_workspace,
     edit_file,
     glob_tool,
@@ -45,12 +45,13 @@ from agent.lc_tools import (
     web_fetch,
     write_file,
 )
-from agent.memory import MemoryStore
-from agent.subagents.registry import SubagentRegistry
-from agent.telemetry import TokenTracker
-from agent.todo import TodoStore
+from agent_core.memory import MemoryStore
+from agent_core.subagents.registry import SubagentRegistry
+from agent_core.telemetry import TokenTracker
+from agent_core.todo import TodoStore
 from agent_by_langgraph.lg_graph import create_agent_graph
 from agent_by_langgraph.lg_tools import dispatch_subagent_lg
+from agent_by_langgraph.level_router import LevelRouter, TaskLevel
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class LGAgent:
         if ticket_id:
             set_ticket_id(ticket_id)
 
-        from agent.skills import get_skills_loader
+        from agent_core.skills import get_skills_loader
         self.skills = skills_loader or get_skills_loader(self.root / "skills")
         set_skills_loader(self.skills)
 
@@ -244,6 +245,10 @@ class LGAgent:
             checkpointer=checkpointer,
         )
         self._system_prompt = system_prompt
+
+        # 级别路由器：根据用户输入判断任务级别
+        self._level_router = LevelRouter(llm=self.llm)
+        self._current_level: TaskLevel | None = None
 
     @property
     def will_have_checkpointer(self) -> bool:
@@ -391,6 +396,11 @@ class LGAgent:
           checkpointer 自动恢复之前的 state（含 SystemMessage + 历史消息），
           add_messages reducer 将新 HumanMessage 追加到已有消息序列末尾。
 
+        级别路由：
+        - 首轮输入时，LevelRouter 判断任务级别
+        - 根据级别调整系统提示词（追加级别约束）
+        - 未实现的级别（5/6）会给出提示
+
         注意：由于节点函数已改为 async def，需要用 asyncio.run() 包装 ainvoke。
         """
         while True:
@@ -399,6 +409,31 @@ class LGAgent:
             except (EOFError, KeyboardInterrupt):
                 print("\n再见！")
                 break
+
+            if not user_input.strip():
+                continue
+
+            # ── 级别路由（仅首轮） ──────────────────────────────
+            if self._first_turn and self._current_level is None:
+                level_config = self._level_router.route(user_input)
+                self._current_level = level_config.level
+
+                if not LevelRouter.is_implemented(level_config.level):
+                    print(f"\n⚠️  {LevelRouter.get_unimplemented_message(level_config.level)}")
+                    print(f"   当前支持的级别：1-文章撰写 | 2-静态网页 | 3-自动化脚本 | 4-网站开发")
+                    print(f"   请重新描述您的需求，或选择已支持的级别。\n")
+                    self._current_level = None
+                    continue
+
+                # 追加级别约束到系统提示词
+                if level_config.extra_prompt:
+                    self._system_prompt += level_config.extra_prompt
+
+                # 调整最大迭代数
+                if level_config.max_iterations != self.max_iterations:
+                    self.max_iterations = level_config.max_iterations
+
+                print(f"[级别路由] → 级别 {level_config.level}: {level_config.label}")
 
             # 流式输出回调：逐 token 打印（与 LCAgent 行为一致）
             class StreamHandler(BaseCallbackHandler):
@@ -567,6 +602,8 @@ class LGAgent:
         """
         if self._checkpointer_initialized:
             return
+        if getattr(self, '_checkpointer_failed', False):
+            return
         if not hasattr(self, '_checkpointer_db_path') or not self._checkpointer_db_path:
             return
 
@@ -606,7 +643,9 @@ class LGAgent:
             logger.info("[Checkpointer] AsyncSqliteSaver 延迟初始化成功: %s", self._checkpointer_db_path)
         except Exception as exc:
             logger.warning("[Checkpointer] 延迟初始化失败: %s，checkpointer 降级为 None", exc)
-            self._checkpointer_initialized = True  # 避免反复尝试
+            self._checkpointer_initialized = False
+            self._checkpointer_failed = True  # 标记失败，避免反复尝试
+            self._checkpointer_db_path = None
 
     async def arun_stream(self, user_input: str) -> AsyncGenerator[str, None]:
         """异步流式运行 Agent，使用 astream_events 逐 token 输出。

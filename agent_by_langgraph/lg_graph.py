@@ -36,7 +36,7 @@ from typing import Annotated, Sequence, TypedDict
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("agent.audit")
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.types import Send, interrupt
@@ -276,7 +276,7 @@ async def _todos_inline(state: AgentState, config: RunnableConfig) -> dict:
     if not isinstance(last, AIMessage) or not last.tool_calls:
         return {"messages": []}
 
-    from agent.lc_tools import update_todos as _update_todos_fn
+    from agent_core.tools import update_todos as _update_todos_fn
     results = []
     for tc in last.tool_calls:
         if tc["name"] != "update_todos":
@@ -315,7 +315,7 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
     - 优先提取 ## 结论 段落，否则取最后 3 行
     - 输出结构化格式：类型、摘要、文件、结论
     """
-    from agent.lc_tools import _ctx_llm_ref, _ctx_sub_reg, _ctx_user_id
+    from agent_core.tools import _ctx_llm_ref, _ctx_sub_reg, _ctx_user_id
     from agent_by_langgraph.lg_subagent import get_subagent_graph
     from agent_by_langgraph.context_var_manager import snapshot as _ctx_snapshot, restore as _ctx_restore
 
@@ -665,7 +665,7 @@ def _should_plan(state: AgentState) -> str:
     last_msg = state["messages"][-1] if state["messages"] else None
     if isinstance(last_msg, HumanMessage):
         # milestone 标记的 HumanMessage 是新用户请求，必须重新规划
-        if last_msg.metadata and last_msg.metadata.get("milestone"):
+        if getattr(last_msg, 'metadata', None) and last_msg.metadata.get("milestone"):
             return "planner"
         # 无 milestone 但是首轮（plan 为空）→ 也需要规划
         if not state.get("plan"):
@@ -690,7 +690,7 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
     - 新用户请求到来时 planner 重新生成计划
     - 从计划中提取初始执行阶段（P3 自适应工具选择）
     """
-    from agent.lc_tools import _ctx_llm_ref
+    from agent_core.tools import _ctx_llm_ref
 
     llm = _ctx_llm_ref.get()
     if llm is None:
@@ -941,7 +941,10 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
     if not has_checkpointer:
         # 无 checkpointer：interrupt() 无法工作
         tool_names = ", ".join(tc["name"] for tc in dangerous_calls)
-        auto_approve = os.environ.get("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "false").lower() in ("true", "1", "yes")
+        # D19: 默认放行而非拒绝。无 checkpointer 时拒绝会导致 Agent 完全无法工作
+        # （write_file/edit_file/run_command 都是危险工具）。
+        # 设置 AUTO_APPROVE_WITHOUT_CHECKPOINTER=false 可改为拒绝（严格模式）。
+        auto_approve = os.environ.get("AUTO_APPROVE_WITHOUT_CHECKPOINTER", "true").lower() in ("true", "1", "yes")
         if auto_approve:
             logger.warning(
                 "[D7] 无 checkpointer，危险工具自动放行: %s。"
@@ -1049,10 +1052,10 @@ def create_agent_graph(
     tool_node = ParallelToolNode(tools)
 
     # 上下文视图裁剪器：在注入 LLM 前裁剪消息，state 保持完整
-    from agent.context_view import ContextView
-    from agent.in_context_compactor import InContextCompactor
-    from agent.decision_summary import DecisionSummaryExtractor, merge_summaries
-    from agent.observation_masker import ObservationMasker
+    from agent_core.context_view import ContextView
+    from agent_core.in_context_compactor import InContextCompactor
+    from agent_core.decision_summary import DecisionSummaryExtractor, merge_summaries
+    from agent_core.observation_masker import ObservationMasker
     _context_view = ContextView()
     _in_context_compactor = InContextCompactor()
     _summary_extractor = DecisionSummaryExtractor()

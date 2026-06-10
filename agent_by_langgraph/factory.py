@@ -36,7 +36,7 @@ _agent_cache_timestamps: dict[str, float] = {}
 
 
 def _get_llm(model: str = None):
-    from agent.lc_agent import DeepSeekChatOpenAI
+    from agent_core.llm import DeepSeekChatOpenAI
     model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
     if model not in _llm_cache:
         _llm_cache[model] = DeepSeekChatOpenAI(
@@ -58,7 +58,7 @@ def _get_openai_client():
 
 
 def _get_skills_loader():
-    from agent.skills import get_skills_loader
+    from agent_core.skills import get_skills_loader
     global _skills_loader_cache
     if _skills_loader_cache is None:
         skills_dir = Path(__file__).parent.parent / "skills"
@@ -67,7 +67,7 @@ def _get_skills_loader():
 
 
 def _get_subagent_registry():
-    from agent.subagents.registry import SubagentRegistry
+    from agent_core.subagents.registry import SubagentRegistry
     global _subagent_registry_cache
     if _subagent_registry_cache is None:
         templates_dir = Path(__file__).parent.parent / "templates" / "subagents"

@@ -1,4 +1,4 @@
-"""LangChain Agent 入口 —— python agent.py 启动"""
+"""Agent 入口 —— python agent.py 启动（LangGraph StateGraph 引擎）"""
 from __future__ import annotations
 
 import sys
@@ -9,8 +9,8 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from agent.lc_agent import LCAgent
+from agent_by_langgraph.lg_agent import LGAgent
 
 if __name__ == "__main__":
-    agent = LCAgent(model="deepseek-v4-flash", max_iterations=50)
+    agent = LGAgent(model="deepseek-v4-flash", max_iterations=50)
     agent.run()

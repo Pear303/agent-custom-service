@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
 
-from agent.subagents.spec import SubagentSpec
+from agent_core.subagents.spec import SubagentSpec
 from agent_by_langgraph.lg_parallel_tools import ParallelToolNode
 
 

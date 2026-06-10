@@ -28,7 +28,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph, add_messages
 
-from agent.subagents.spec import SubagentSpec
+from agent_core.subagents.spec import SubagentSpec
 from agent_by_langgraph.lg_parallel_tools import ParallelToolNode
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ def create_rag_subagent_graph(
         CompiledGraph
     """
     from agent_by_langgraph.lg_tools import make_subagent_tools
-    from agent.rag.chains import rewrite_query, multi_query_retrieve, grade_documents, format_rag_context
+    from agent_core.rag.chains import rewrite_query, multi_query_retrieve, grade_documents, format_rag_context
 
     # 构建工具列表（make_subagent_tools 已包含 rag_search）
     tools = make_subagent_tools(spec.tool_names)

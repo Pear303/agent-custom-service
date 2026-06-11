@@ -91,6 +91,13 @@ def dispatch_subagent_lg(agent_name: str, task: str) -> str:
 
     单个调用时也走 Send 路径，保持一致性。
 
+    何时派遣子代理（重要！）：
+    - 多文件并行开发（3+文件）→ 派遣 engine_executor 创建/修改代码文件
+    - 需要查资料/搜索文档 → 派遣 web_researcher（只读+网络访问）
+    - 需要验证结果/运行测试 → 派遣 validator（只读校验）
+    - 简单快速确认/查询 → 派遣 quick_helper（轻量只读）
+    - 文档处理/分析 → 派遣 doc_analyzer 或 document_processor
+
     agent_name 可用值: quick_helper, web_researcher, doc_analyzer,
     engine_executor, validator, skill_manager, document_processor,
     system_maintainer（详见 `agent.subagents.registry.SubagentRegistry`）

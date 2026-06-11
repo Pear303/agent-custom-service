@@ -253,7 +253,7 @@ async def _invoke_lg_async_inner(agent, prompt: str):
     all_callbacks.append(collector)
     config = {
         "callbacks": all_callbacks,
-        "recursion_limit": agent.max_iterations * 2 + 5,
+        "recursion_limit": agent.max_iterations * 4 + 10,
         "configurable": {
             "thread_id": agent.user_id or "default",
             "__has_checkpointer__": agent.will_have_checkpointer,
@@ -333,7 +333,7 @@ async def resume_lg_approval(agent, decision: str, thread_id: str) -> dict:
     from langgraph.types import Command
 
     config = {
-        "recursion_limit": agent.max_iterations * 2 + 5,
+        "recursion_limit": agent.max_iterations * 4 + 10,
         "configurable": {"thread_id": thread_id},
     }
 

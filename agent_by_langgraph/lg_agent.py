@@ -133,6 +133,17 @@ class LGAgent:
         self._invoke_lock = threading.Lock()  # 保护 _first_turn 和 graph.ainvoke 的串行化（同步路径）
         self._async_invoke_lock = asyncio.Lock()  # 保护 async 路径的串行化
 
+        # LangSmith 追踪初始化：设置环境变量后 LangChain/LangGraph 自动上报
+        if os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true":
+            if not os.getenv("LANGCHAIN_API_KEY"):
+                logger.warning("[LangSmith] LANGCHAIN_TRACING_V2=true 但未设置 LANGCHAIN_API_KEY，追踪将不生效")
+            else:
+                os.environ.setdefault("LANGCHAIN_PROJECT", "agent-custom-service")
+                logger.info(
+                    "[LangSmith] 追踪已启用, project=%s",
+                    os.getenv("LANGCHAIN_PROJECT", "agent-custom-service"),
+                )
+
         self.llm = llm or create_deepseek_llm(model)
 
         workspace = _build_workspace(self.root, user_id, ticket_id)
@@ -234,6 +245,29 @@ class LGAgent:
             "需要修改文件的子代理请等待进入 modify 阶段后再派遣。"
         )
         system_prompt += todo_constraint
+
+        # 工具使用最佳实践：引导 Agent 形成 read→write→edit→run 迭代循环
+        tool_best_practices = (
+            "\n\n---\n\n# 工具使用最佳实践\n\n"
+            "## 写后必审\n"
+            "用 write_file 创建文件后，用 read_file 检查内容是否正确写入，"
+            "特别是检查：缩进、编码、关键函数定义是否完整。\n\n"
+            "## 跑后必修\n"
+            "用 run_command 运行测试后，如果失败：\n"
+            "1. 仔细阅读错误信息\n"
+            "2. 用 read_file 查看相关代码\n"
+            "3. 用 edit_file 精准修复（不要用 write_file 重写整个文件）\n"
+            "4. 再次 run_command 验证修复\n\n"
+            "## 复杂任务分治\n"
+            "当任务涉及 3 个以上文件时，考虑用 dispatch_subagent_lg 派遣子代理并行处理：\n"
+            "- engine_executor: 可读写执行，适合创建/修改代码文件\n"
+            "- web_researcher: 只读+网络，适合查资料\n"
+            "- validator: 只读校验，适合验证结果\n\n"
+            "## gather 阶段不要跳过\n"
+            "进入 gather 阶段时，先用 glob_tool 查看目录结构、read_file 查看已有文件，"
+            "充分了解上下文后再动手写代码。直接跳到写代码容易遗漏需求。"
+        )
+        system_prompt += tool_best_practices
 
         # 初始化 LangGraph Checkpointer（SQLite 持久化）
         # 启用后支持：状态持久化、时间旅行调试、断点续跑
@@ -685,7 +719,7 @@ class LGAgent:
 
         config: RunnableConfig = {
             "callbacks": list(getattr(self.graph, '_lg_llm_callbacks', [])),
-            "recursion_limit": self.max_iterations * 2 + 5,
+            "recursion_limit": self.max_iterations * 4 + 10,
             "configurable": {
                 "thread_id": self.user_id or "default",
                 "__has_checkpointer__": _will_have_checkpointer,

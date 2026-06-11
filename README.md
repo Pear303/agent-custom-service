@@ -43,7 +43,7 @@ localhost/app
 ```
 agent.py                  CLI 入口（LangChain Agent）
 agent_lg.py               CLI 入口（LangGraph Agent）
-api/                      FastAPI 服务层（开发与业务分离）
+api/                      FastAPI 服务层
 ├── main.py               应用入口、SSE 流式输出、路由挂载
 ├── core/                 核心基础设施
 │   ├── config.py         环境变量配置
@@ -60,26 +60,38 @@ api/                      FastAPI 服务层（开发与业务分离）
 ├── task_queue.py          异步任务队列（Worker Pool）
 ├── schemas/              请求/响应模型（Pydantic）
 └── utils/                工具函数（文件管理、进度计算）
-agent/                    Agent 核心逻辑（LangChain 实现）
-├── lc_agent.py           主 Agent 循环（LCAgent）
-├── lc_tools.py           工具定义（@tool 函数）
-├── subagent_parallel.py  子代理只读工具并发执行器
-├── memory.py             三层记忆存储
+agent_core/               Agent 核心逻辑（LangChain 实现）
 ├── compactor.py          历史压缩 → 情景记忆 + MEMORY.md
 ├── context.py            system prompt 构建
+├── context_view.py       上下文视图
+├── decision_summary.py   决策摘要
+├── in_context_compactor.py  上下文内压缩
+├── llm.py                LLM 调用封装
+├── memory.py             三层记忆存储
+├── observation_masker.py  观察掩码
 ├── skills.py             技能加载器
 ├── telemetry.py          token 用量追踪
-├── factory.py            Agent 工厂（共享资源缓存）
 ├── todo.py               update_todos 实现
-├── embeddings/           向量嵌入（ChromaDB 存储与检索）
-└── subagents/
-    ├── registry.py       子代理注册表（工具白名单 + max_turns）
-    └── spec.py           子代理规格定义
+├── rag/                  RAG 模块
+│   ├── chains.py         RAG 链路
+│   ├── embeddings.py     向量嵌入
+│   ├── indexer.py        索引器
+│   ├── reranker.py       重排序
+│   ├── retriever.py      检索器
+│   └── vectorstore.py    向量存储
+├── subagents/
+│   ├── registry.py       子代理注册表（工具白名单 + max_turns）
+│   └── spec.py           子代理规格定义
+└── tools/                工具定义（文件、搜索、shell、技能、todo、web、workspace）
 agent_by_langgraph/       Agent 核心逻辑（LangGraph 实现）
 ├── lg_agent.py           LangGraph Agent 循环
 ├── lg_graph.py           状态图定义
 ├── lg_subagent.py        子代理并发执行
+├── lg_parallel_tools.py  并发工具执行
+├── lg_rag_subagent.py    RAG 子代理
 ├── lg_tools.py           工具定义
+├── context_var_manager.py 上下文变量管理
+├── level_router.py       级别路由
 └── factory.py            Agent 工厂
 frontend/                 Vue 3 前端（前后端分离，独立构建）
 ├── src/
@@ -91,20 +103,15 @@ frontend/                 Vue 3 前端（前后端分离，独立构建）
 │   ├── views/            页面组件（ChatView、RequirementView、TicketDetailView）
 │   ├── components/       UI 组件（ChatMessage、ChatInput、TicketCard 等）
 │   ├── types/            TypeScript 类型定义
-│   └── assets/           CSS 设计系统（27 个 Design Token）
+│   └── assets/           CSS 设计系统
 ├── vite.config.ts        Vite 构建配置（@ 别名、API 代理）
 └── package.json          依赖清单（Vue 3、Pinia、Vue Router、Axios）
-static/                   静态文件目录（保留兼容）
 templates/                身份/引导与提示词模板
 ├── SOUL.md               Agent 身份引导
 ├── SOUL_CS.md            客服身份引导
 ├── USER.md               用户偏好档案
 ├── agent/                Agent 系统提示词模板
 └── subagents/            子代理身份模板（11 种）
-services/                 外部服务集成
-└── dify/                 Dify 智能客服客户端
-scripts/                  工具脚本（数据库迁移、数据校验等）
-skills/                   可插拔技能包（基础技能随仓库分发）
 Dockerfile                Docker 容器镜像
 docker-compose.yml        Docker Compose 编排
 ```

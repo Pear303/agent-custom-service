@@ -73,13 +73,20 @@ def _build_index_to_group(messages: list[BaseMessage]) -> dict[int, int]:
 
 
 def _ensure_tool_call_integrity(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """确保 AIMessage(tool_calls) 后紧跟所有对应的 ToolMessage。"""
+    """确保 AIMessage(tool_calls) 后紧跟所有对应的 ToolMessage。
+
+    OpenAI API 要求：AIMessage(tool_calls) 后必须紧接着所有对应的 ToolMessage，
+    中间不能插入其他消息。此函数：
+    1. 移除没有对应 ToolMessage 的 tool_calls（或整个 AIMessage）
+    2. 将 ToolMessage 移到其 AIMessage(tool_calls) 紧后面，确保顺序正确
+    """
     existing_tool_call_ids: set[str] = set()
     for msg in messages:
         if isinstance(msg, ToolMessage):
             existing_tool_call_ids.add(msg.tool_call_id)
 
-    result: list[BaseMessage] = []
+    # 第一步：过滤掉没有 ToolMessage 的 tool_calls
+    filtered: list[BaseMessage] = []
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             complete_calls = [
@@ -102,11 +109,45 @@ def _ensure_tool_call_integrity(messages: list[BaseMessage]) -> list[BaseMessage
                     id=msg.id,
                     additional_kwargs=new_additional_kwargs,
                 )
-                result.append(new_msg)
+                filtered.append(new_msg)
             else:
-                result.append(msg)
+                filtered.append(msg)
         else:
-            result.append(msg)
+            filtered.append(msg)
+
+    # 第二步：确保 ToolMessage 紧跟在 AIMessage(tool_calls) 之后
+    # 收集每个 AIMessage 的 tool_call_ids
+    result: list[BaseMessage] = []
+    i = 0
+    while i < len(filtered):
+        msg = filtered[i]
+        result.append(msg)
+
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            # 收集此 AIMessage 的所有 tool_call_ids
+            tc_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
+            # 从后续消息中找到对应的 ToolMessage，紧跟插入
+            remaining = filtered[i + 1:]
+            tool_msgs_for_this = []
+            other_msgs = []
+            for later_msg in remaining:
+                if isinstance(later_msg, ToolMessage) and later_msg.tool_call_id in tc_ids:
+                    tool_msgs_for_this.append(later_msg)
+                else:
+                    other_msgs.append(later_msg)
+
+            # 将 ToolMessage 紧跟在 AIMessage 后面
+            result.extend(tool_msgs_for_this)
+
+            # 重建剩余消息列表（去掉已提取的 ToolMessage）
+            filtered = filtered[:i + 1] + other_msgs
+            # i 已经指向 AIMessage，下一步跳过已处理的 ToolMessage
+            i += 1
+            # 继续处理 other_msgs
+            continue
+
+        i += 1
+
     return result
 
 

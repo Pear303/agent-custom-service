@@ -51,14 +51,14 @@ _DANGEROUS_TOOLS = frozenset({
 
 # ── 自适应工具分组（P3）────────────────────────────────────────
 # gather 阶段：只读工具，信息收集（核心限制：防止未收集信息就修改）
-# D5: 允许 run_command，因为只读命令（如 python test.py、ls）也是信息收集
+# D5: gather 阶段不包含 run_command，防止 Agent 用 shell 命令（pwd/dir/ls）
+# 探测路径而非使用 glob_tool/grep_tool 等专用只读工具。
+# 如果 gather 阶段需要运行脚本收集信息，应通过 dispatch_subagent_lg 派遣子代理。
 # 注：dispatch_subagent_lg 在 gather 阶段可用，但 LLM 应优先派遣只读子代理
-#     （SubagentSpec.read_only=True）。非只读子代理在 gather 阶段可能执行写操作，
-#     违反 gather 只读语义，但保留此工具以支持灵活的信息收集场景。
+#     （SubagentSpec.read_only=True）。
 _GATHER_TOOLS = frozenset({
     "read_file", "grep_tool", "glob_tool", "web_fetch",
     "load_skill", "dispatch_subagent_lg", "update_todos",
-    "run_command",
 })
 # modify 阶段：全量工具（修改时需要只读工具辅助参考，无限制必要）
 _MODIFY_TOOLS = frozenset({
@@ -75,42 +75,9 @@ _VERIFY_TOOLS = frozenset({
 # 注：modify/verify 包含全量工具是设计意图，非遗漏。
 # P3 的核心价值是 gather 阶段阻止过早修改，后续阶段无需额外限制。
 
-# 子代理 checkpointer 缓存（线程安全）
-_sub_checkpointer_cache: OrderedDict[str, tuple] = OrderedDict()
-_sub_checkpointer_lock = threading.Lock()
-_MAX_SUB_CHECKPOINTER_CACHE_SIZE = 50
-
 # D14: 使用 UUID 哨兵值，避免与子代理输出内容冲突
 import uuid
 _SUBAGENT_CLEAR_SENTINEL = f"__SUBAGENT_CLEAR_{uuid.uuid4().hex}__"
-
-
-
-
-async def _invoke_with_retry(subgraph, sub_input: dict, sub_config: dict, agent_name: str, max_retries: int = 3):
-    """带重试的子图调用，处理 SQLite 'database is locked' 错误。
-
-    高并发场景下多个子代理同时写入同一 SQLite 数据库，
-    即使启用 WAL 模式仍可能短暂锁冲突。重试机制确保瞬态错误不导致任务失败。
-    """
-    import asyncio
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            return await subgraph.ainvoke(sub_input, config=sub_config)
-        except Exception as exc:
-            last_exc = exc
-            err_msg = str(exc).lower()
-            if "database is locked" in err_msg or "locked" in err_msg:
-                wait = 0.5 * (2 ** attempt)  # 指数退避: 0.5s, 1s, 2s
-                logger.warning(
-                    "[SubCheckpointer] %s 数据库锁定，第 %d/%d 次重试（等待 %.1fs）",
-                    agent_name, attempt + 1, max_retries, wait,
-                )
-                await asyncio.sleep(wait)
-            else:
-                raise
-    raise last_exc
 
 
 def _replace_results(existing: list[str], new: list[str]) -> list[str]:
@@ -167,6 +134,12 @@ class AgentState(TypedDict):
     _stall_count: int
     _pending_tool_calls: list[dict]
     _compaction_summary: str
+    _reflection_result: str
+    _reflection_count: int
+    _deviation_count: int
+    _deviation_reason: str
+    _interrupt_repeat_count: int
+    _interrupt_last_tool_sig: str
 
 
 class SubagentWorkerState(TypedDict):
@@ -182,10 +155,12 @@ class SubagentWorkerState(TypedDict):
 
 
 def _route_after_agent(state: AgentState) -> str | list[Send]:
-    """agent 节点后的路由：区分普通工具调用、子代理派遣、危险工具审批、直接结束。
+    """agent 节点后的路由：区分普通工具调用、子代理派遣、危险工具审批、反思、直接结束。
 
     路由优先级：
-    1. 无 tool_calls → END
+    1. 无 tool_calls → 检查是否需要反思
+       - verify 阶段 + 有计划 + 反思次数未超限 → reflect
+       - 否则 → END
     2. 有 dispatch_subagent_lg 调用 → 直接返回 list[Send] 并行派遣
        - 混合调用时，非子代理的 tool_calls 暂存到 _pending_tool_calls，
          由 aggregate_results 恢复到消息流
@@ -203,6 +178,26 @@ def _route_after_agent(state: AgentState) -> str | list[Send]:
     last = state["messages"][-1]
 
     if not isinstance(last, AIMessage) or not last.tool_calls:
+        # agent 想结束对话 → 检查是否需要反思
+        phase = state.get("_phase", "gather") or "gather"
+        reflection_count = state.get("_reflection_count", 0) or 0
+        plan = state.get("plan", "")
+
+        # 反思触发条件：
+        # 1. 有实质计划（非"无需规划"）
+        # 2. 计划步骤 > 2（简单任务不需要反思）
+        # 3. 反思次数未超限
+        _is_simple_plan = (
+            not plan
+            or plan == "无需规划"
+            or len(re.findall(r'^\d+\.\s', plan, re.MULTILINE)) <= 2
+        )
+        if not _is_simple_plan:
+            if phase == "verify" and reflection_count < 2:
+                return "reflect"
+            if phase == "modify" and reflection_count < 1:
+                return "reflect"
+
         return END
 
     # 分类 tool_calls
@@ -364,42 +359,13 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
         user_id = _ctx_user_id.get() or "default"
         sub_thread_id = f"{user_id}:sub:{agent_name}:{int(time.time() * 1000)}"
 
-        # 尝试从主图的 checkpointer 复用（同类型子代理共享 checkpointer 实例）
-        # _subagent_worker 是 async 节点，已在事件循环中，
-        # 可直接 await 初始化 AsyncSqliteSaver，无需 asyncio.run()
+        # 子代理使用内存 checkpointer（无需持久化，避免 SQLite 锁冲突）
         sub_checkpointer = None
         try:
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-            from pathlib import Path
-            db_path = Path("data") / "users" / user_id / "subagent_checkpoints.db"
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            # 线程安全地获取或创建 checkpointer
-            with _sub_checkpointer_lock:
-                # LRU: 访问时移到末尾
-                if user_id in _sub_checkpointer_cache:
-                    _sub_checkpointer_cache.move_to_end(user_id)
-                else:
-                    # 超容量时淘汰最久未用的
-                    while len(_sub_checkpointer_cache) >= _MAX_SUB_CHECKPOINTER_CACHE_SIZE:
-                        oldest_key, (old_ctx, _) = _sub_checkpointer_cache.popitem(last=False)
-                        try:
-                            await old_ctx.__aexit__(None, None, None)
-                            logger.info("[SubCheckpointer] LRU 淘汰: user_id=%s", oldest_key)
-                        except Exception:
-                            pass
-                    ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
-                    # 直接 await：_subagent_worker 是 async 节点，已在事件循环中
-                    checkpointer_instance = await ctx.__aenter__()
-                    # 启用 WAL 模式：子代理并行写入时不互相阻塞
-                    try:
-                        await checkpointer_instance.db.execute("PRAGMA journal_mode=WAL")
-                        await checkpointer_instance.db.execute("PRAGMA busy_timeout=5000")
-                    except Exception:
-                        pass
-                    _sub_checkpointer_cache[user_id] = (ctx, checkpointer_instance)
-                sub_checkpointer = _sub_checkpointer_cache[user_id][1]
-        except Exception as exc:
-            logger.warning("[SubCheckpointer] 初始化失败，降级为无状态执行: %s", exc)
+            from langgraph.checkpoint.memory import MemorySaver
+            sub_checkpointer = MemorySaver()
+        except ImportError:
+            logger.warning("[SubCheckpointer] MemorySaver 不可用，降级为无状态执行")
 
         try:
             subgraph = get_subagent_graph(llm, registry, agent_name, checkpointer=sub_checkpointer)
@@ -418,7 +384,7 @@ async def _subagent_worker(state: SubagentWorkerState, config: RunnableConfig) -
                     "rag_context": "",
                     "needs_web_fallback": False,
                 })
-            result = await _invoke_with_retry(subgraph, sub_input, sub_config, agent_name)
+            result = await subgraph.ainvoke(sub_input, config=sub_config)
         except Exception as exc:
             return {"subagent_results": [f"[{agent_name}] Error: {exc}"]}
 
@@ -585,12 +551,13 @@ def _extract_conclusion(text: str) -> str:
     """从子代理输出中提取结论。
 
     优先级：
-    1. ## 结论/总结/结果 标题下的内容
+    1. ## 结论/总结/结果/执行结果/最终答案 标题下的内容
     2. 最后 3 行非空文本
     """
-    # 策略1: 提取结构化结论
+    # 策略1: 提取结构化结论（支持冒号、空格等变体）
     conclusion_match = re.search(
-        r'(?:^|\n)##\s*(?:结论|总结|结果|Conclusion|Summary|Result)\s*\n(.*?)(?:\n##|\Z)',
+        r'(?:^|\n)##\s*(?:结论|总结|结果|执行结果|最终答案|Conclusion|Summary|Result|Final Answer)'
+        r'[:：]?\s*\n(.*?)(?:\n##|\Z)',
         text, re.DOTALL | re.IGNORECASE
     )
     if conclusion_match:
@@ -625,6 +592,54 @@ def _extract_file_paths(text: str) -> list[str]:
         re.IGNORECASE,
     )
 
+
+# ── Reflection ─────────────────────────────────────────────────
+
+_REFLECTION_PROMPT = """\
+你是一个质量审查员。请评估当前工作是否完整、正确地解决了用户的需求。
+
+评估维度：
+1. 完整性：用户需求的所有要点是否都已处理？
+2. 正确性：代码/文件修改是否正确？有无语法错误或逻辑问题？
+3. 一致性：修改是否与已有代码风格一致？是否引入冲突？
+
+当前执行计划：
+{plan}
+
+当前执行阶段：{phase}
+
+请输出评估结果：
+- 如果工作已完成且质量合格，输出：[反思: 通过] 然后给出最终总结
+- 如果发现问题需要修复，输出：[反思: 回退] 然后说明需要修复什么
+
+注意：不要无理由回退。只有发现明确的遗漏或错误时才回退。
+"""
+
+# ── Replanner ──────────────────────────────────────────────────
+
+_REPLANNER_PROMPT = """\
+你是一个任务规划修正器。根据执行进度和遇到的问题，修正原有执行计划。
+
+原计划：
+{original_plan}
+
+当前遇到的问题/偏差：
+{deviation_reason}
+
+最近执行摘要：
+{recent_summary}
+
+请基于以上信息，输出修正后的执行计划。规则：
+1. 保留仍有效的步骤
+2. 修正有问题的步骤
+3. 如需新增步骤，追加在末尾
+4. 步骤不超过 7 步
+5. 最后一行标注当前应进入的阶段：[阶段: gather/modify/verify]
+
+输出格式：
+1. [步骤描述] → 执行者: 自己, 工具: xxx
+2. ...
+"""
 
 # ── Plan-then-Execute ──────────────────────────────────────────
 
@@ -701,14 +716,15 @@ def _should_plan(state: AgentState) -> str:
     """判断是否需要规划：新请求总是重新规划，已有计划则直接执行。
 
     路由逻辑：
-    - 最新消息是 milestone HumanMessage（新用户请求）→ "planner"
-      即使旧 plan 残留也必须重新规划，避免旧计划劫持新请求
+    - 最新消息是 milestone HumanMessage（新用户请求）→ 总是走 planner
+      （planner 会根据任务复杂度决定是否生成计划，同时清除旧状态）
     - plan 非空且非新请求 → "agent"（循环中，按已有计划执行）
     - plan 为空 → "planner"（首轮或 plan 被清空）
     """
     last_msg = state["messages"][-1] if state["messages"] else None
     if isinstance(last_msg, HumanMessage):
-        # milestone 标记的 HumanMessage 是新用户请求，必须重新规划
+        # milestone 标记的 HumanMessage 是新用户请求
+        # 总是走 planner：1) 清除旧状态 2) 生成新计划（简单任务返回"无需规划"）
         if getattr(last_msg, 'metadata', None) and last_msg.metadata.get("milestone"):
             return "planner"
         # 无 milestone 但是首轮（plan 为空）→ 也需要规划
@@ -729,16 +745,18 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
     使用无工具的 LLM 做纯推理规划，避免工具调用干扰。
 
     设计要点：
-    - 只在 plan 为空时触发（新用户请求）
+    - 新用户请求（milestone）到来时强制重新规划，清除旧计划和相关状态
     - agent 循环中 plan 保持不变，agent 按计划执行
-    - 新用户请求到来时 planner 重新生成计划
     - 从计划中提取初始执行阶段（P3 自适应工具选择）
     """
     from agent_core.tools import _ctx_llm_ref
 
     llm = _ctx_llm_ref.get()
     if llm is None:
-        return {"plan": "", "_phase": "gather", "_stall_count": 0}
+        return {"plan": "", "_phase": "gather", "_stall_count": 0,
+                "_deviation_count": 0, "_deviation_reason": "",
+                "_interrupt_repeat_count": 0, "_interrupt_last_tool_sig": "",
+                "_reflection_count": 0, "_compaction_summary": ""}
 
     # 提取用户最近的请求
     user_request = ""
@@ -753,7 +771,30 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
             break
 
     if not user_request.strip():
-        return {"plan": "", "_phase": "gather", "_stall_count": 0}
+        return {"plan": "", "_phase": "gather", "_stall_count": 0,
+                "_deviation_count": 0, "_deviation_reason": "",
+                "_interrupt_repeat_count": 0, "_interrupt_last_tool_sig": "",
+                "_reflection_count": 0, "_compaction_summary": ""}
+
+    # 简单任务快速路径：短消息且无开发/复杂关键词时跳过 LLM 规划
+    _SIMPLE_TASK_MAX_LEN = 80
+    _COMPLEX_KEYWORDS = ("系统", "架构", "集成", "多个", "数据库", "API", "微服务",
+                          "部署", "测试", "重构", "迁移", "平台", "流程")
+    _DEV_COMPOUND = re.compile(
+        r'(写|创建|开发|构建|实现|编写|生成|制作|修改|编辑|修复|添加|删除)'
+        r'.*(脚本|程序|文件|应用|网页|工具|服务|项目|模块|组件|接口|函数|类)'
+    )
+    is_simple = (
+        len(user_request) <= _SIMPLE_TASK_MAX_LEN
+        and not any(kw in user_request for kw in _COMPLEX_KEYWORDS)
+        and not bool(_DEV_COMPOUND.search(user_request))
+    )
+    if is_simple:
+        logger.info("[规划跳过] 简单任务，无需规划: %s", user_request[:50])
+        return {"plan": "无需规划", "_phase": "all", "_stall_count": 0,
+                "_deviation_count": 0, "_deviation_reason": "",
+                "_interrupt_repeat_count": 0, "_interrupt_last_tool_sig": "",
+                "_reflection_count": 0, "_compaction_summary": ""}
 
     planning_input = _PLANNER_PROMPT.format(request=user_request)
     try:
@@ -772,31 +813,47 @@ async def _plan_node(state: AgentState, config: RunnableConfig) -> dict:
     # 从计划中提取初始阶段
     phase = _extract_phase(plan_text)
 
-    return {"plan": plan_text, "_phase": phase, "_stall_count": 0}
+    # 新规划时清除所有旧状态，防止旧上下文污染新任务
+    return {"plan": plan_text, "_phase": phase, "_stall_count": 0,
+            "_deviation_count": 0, "_deviation_reason": "",
+            "_interrupt_repeat_count": 0, "_interrupt_last_tool_sig": "",
+            "_reflection_count": 0, "_compaction_summary": ""}
 
 
 def _extract_phase(plan_text: str) -> str:
     """从规划输出中提取执行阶段。
 
     查找 [阶段: xxx] 标记，未找到时根据内容推断：
-    - 开发/创建/构建类（涉及写新文件）→ "gather"（先收集再动手）
+    - 简单创建任务（步骤 ≤ 2 且涉及写文件）→ "modify"（直接动手，无需先收集信息）
+    - 复杂创建任务（步骤 ≥ 3）→ "gather"（先收集信息再动手）
     - 纯修改/编辑类（已有代码需修改）→ "modify"
     - 搜索/查找/阅读类 → "gather"
     - 默认 → "gather"
-
-    推断优先级：开发类 > 修改类 > 搜索类 > 默认
-    因为"开发天气应用"的计划中会自然出现"创建文件"等修改词，
-    但这类任务应先收集信息（查看目录、已有文件），再动手写代码。
     """
+    step_count = len(re.findall(r'^\d+\.\s', plan_text, re.MULTILINE))
+    has_create_keyword = bool(re.search(
+        r'(创建|写|编写|生成|新建).*(文件|脚本|程序|模块|\.\w{1,4}\b)',
+        plan_text, re.IGNORECASE
+    ))
+
     match = re.search(r'\[阶段[:：]\s*(gather|modify|verify)\]', plan_text, re.IGNORECASE)
     if match:
-        return match.group(1).lower()
+        marker_phase = match.group(1).lower()
+        # 修正：即使规划器标记为 gather，如果步骤 ≤ 2 且涉及创建/写文件，
+        # 应直接推断为 modify，避免 gather 阶段无写工具导致停滞
+        if marker_phase == "gather" and step_count <= 2 and has_create_keyword:
+            logger.info("[阶段修正] 简单创建任务 gather → modify: 步骤=%d", step_count)
+            return "modify"
+        return marker_phase
+
+    # 简单创建任务（步骤 ≤ 2 且涉及创建/写文件）→ modify
+    if step_count <= 2 and has_create_keyword:
+        return "modify"
 
     # 推断：开发/创建/构建类 → gather（先收集信息再动手）
     if re.search(r'(开发|创建|构建|搭建|新建|实现|设计|编写).*(应用|项目|程序|系统|工具|脚本|网页|网站|服务)', plan_text):
         return "gather"
     # 推断：步骤数 >= 3 → gather（复杂任务先收集信息）
-    step_count = len(re.findall(r'^\d+\.\s', plan_text, re.MULTILINE))
     if step_count >= 3:
         return "gather"
     # 推断：纯修改/编辑（不涉及新建）→ modify
@@ -850,11 +907,111 @@ def _bind_tools_for_phase(llm, all_tools, llm_with_all_tools, phase: str, stall_
     return llm.bind_tools(filtered)
 
 
+def _detect_deviation(
+    state: AgentState,
+    new_stall: int,
+    deviation_count: int,
+    deviation_reason: str,
+) -> tuple[int, str]:
+    """偏差检测：分析执行状态，返回 (new_deviation_count, new_deviation_reason)。
+
+    检测信号：
+    1. 不可恢复的工具错误 → deviation_count +1
+    2. 计划步骤停滞（stall_count >= 2）→ deviation_count +1
+    3. 连续 3 轮相同工具调用 → deviation_count +1
+    4. 连续 3 轮完全相同的工具调用（死循环）→ deviation_count +2
+    5. 无偏差信号 → deviation_count 衰减 -1
+
+    Args:
+        state: 当前 Agent 状态
+        new_stall: 本轮更新后的停滞计数
+        deviation_count: 当前偏差计数
+        deviation_reason: 当前偏差原因
+
+    Returns:
+        (new_deviation_count, new_deviation_reason)
+    """
+    _RECOVERABLE_ERROR_PATTERNS = (
+        "参数为空", "path 参数", "必须提供", "未找到", "not found",
+        "no such file", "does not exist", "missing", "required",
+    )
+    has_tool_error = False
+    is_recoverable_error = False
+    tool_error_detail = ""
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            if msg.status == "error":
+                has_tool_error = True
+                tool_error_detail = str(msg.content)[:200] if msg.content else ""
+                error_lower = tool_error_detail.lower()
+                is_recoverable_error = any(
+                    pattern.lower() in error_lower for pattern in _RECOVERABLE_ERROR_PATTERNS
+                )
+            break
+
+    if has_tool_error and not is_recoverable_error:
+        deviation_count += 1
+        deviation_reason = "工具执行出错"
+        logger.info("[偏差检测] 工具错误(不可恢复), deviation_count=%d, detail=%s",
+                    deviation_count, tool_error_detail[:80])
+    elif has_tool_error and is_recoverable_error:
+        logger.info("[偏差检测] 工具错误(可恢复，不计入偏差), detail=%s", tool_error_detail[:80])
+    elif new_stall >= 2:
+        deviation_count += 1
+        deviation_reason = f"计划步骤停滞 (stall_count={new_stall})"
+        logger.info("[偏差检测] 计划停滞, deviation_count=%d", deviation_count)
+    else:
+        # 信号3：连续调用同一工具且参数高度相似
+        recent_ai_msgs = [
+            m for m in messages[-8:]
+            if isinstance(m, AIMessage) and m.tool_calls
+        ]
+        if len(recent_ai_msgs) >= 3:
+            recent_tool_sets = [
+                frozenset(tc["name"] for tc in m.tool_calls)
+                for m in recent_ai_msgs[-3:]
+            ]
+            if len(recent_tool_sets) == 3 and recent_tool_sets[0] == recent_tool_sets[1] == recent_tool_sets[2]:
+                def _tool_call_sig(msg: AIMessage) -> str:
+                    parts = []
+                    for tc in msg.tool_calls:
+                        args_str = str(tc.get("args", {}))[:100]
+                        parts.append(f"{tc['name']}:{args_str}")
+                    return "|".join(sorted(parts))
+
+                sigs = [_tool_call_sig(m) for m in recent_ai_msgs[-3:]]
+                if sigs[0] == sigs[1] == sigs[2]:
+                    deviation_count += 2
+                    deviation_reason = f"连续 3 轮完全相同的工具调用（死循环）: {recent_tool_sets[0]}"
+                    logger.warning(
+                        "[偏差检测] 死循环, deviation_count=%d, sig=%s",
+                        deviation_count, sigs[0][:80],
+                    )
+                else:
+                    deviation_count += 1
+                    deviation_reason = f"连续 3 轮调用相同工具: {recent_tool_sets[0]}"
+                    logger.info(
+                        "[偏差检测] 连续同工具, deviation_count=%d, tools=%s",
+                        deviation_count, recent_tool_sets[0],
+                    )
+            else:
+                deviation_count = max(0, deviation_count - 1)
+                if deviation_count == 0:
+                    deviation_reason = ""
+        else:
+            deviation_count = max(0, deviation_count - 1)
+            if deviation_count == 0:
+                deviation_reason = ""
+
+    return deviation_count, deviation_reason
+
+
 def _advance_phase(state: AgentState) -> dict:
-    """自动推进执行阶段 + 停滞检测（P3）。
+    """自动推进执行阶段 + 停滞检测 + 偏差检测（P3）。
 
     阶段推进规则：
-    - gather → modify：agent 调用了写工具（write_file, edit_file, run_command）
+    - gather → modify：agent 调用了写工具（write_file, edit_file）
     - modify → verify：agent 返回文本（无 tool_calls），表示修改完成
     - verify → verify：保持不变
 
@@ -862,9 +1019,14 @@ def _advance_phase(state: AgentState) -> dict:
     - agent 在过滤模式下返回空 tool_calls → stall_count +1
     - 连续 2 次停滞 → 回退到 "all" 阶段
 
+    偏差检测：
+    - 连续工具错误（最近 ToolMessage status=error）→ deviation_count +1
+    - 计划步骤停滞（stall_count >= 3）→ deviation_count +1
+    - deviation_count >= 2 → 触发 replanner 重新规划
+
     注意：
     - 此节点在 agent 之后、route_after_agent 之前执行，
-      不修改 messages，只更新 _phase 和 _stall_count。
+      不修改 messages，只更新 _phase、_stall_count、_deviation_count 等。
     - 阶段推进是"预判"而非"确认"：如果危险工具被审批拒绝，
       下一轮 agent 会重新调用工具，_advance_phase 会再次评估。
       这不会造成问题，因为：
@@ -874,18 +1036,34 @@ def _advance_phase(state: AgentState) -> dict:
     """
     phase = state.get("_phase", "gather") or "gather"
     stall_count = state.get("_stall_count", 0) or 0
+    deviation_count = state.get("_deviation_count", 0) or 0
+    deviation_reason = state.get("_deviation_reason", "") or ""
 
     last = state["messages"][-1] if state["messages"] else None
     if not isinstance(last, AIMessage):
-        return {"_phase": phase, "_stall_count": stall_count}
+        return {"_phase": phase, "_stall_count": stall_count,
+                "_deviation_count": deviation_count, "_deviation_reason": deviation_reason}
 
     # 检测 agent 是否调用了写工具
     # D5: run_command 在 gather 阶段允许用于信息收集（如运行测试），
     # 不应触发 gather→modify 推进。只有 write_file/edit_file 才是真正的修改。
+    # D21: 但如果 run_command 中包含 python -c + open('w') 的写操作，
+    # 也应触发阶段推进（Agent 试图绕过专用工具写文件）。
     _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
     has_modify_calls = bool(last.tool_calls) and any(
         tc["name"] in _WRITE_TOOLS for tc in last.tool_calls
     )
+    # 轻量检测 run_command 中的写操作
+    if not has_modify_calls:
+        import re as _phase_re
+        for tc in last.tool_calls:
+            if tc["name"] == "run_command":
+                cmd = str(tc.get("args", {}).get("command", ""))
+                if cmd.lower().startswith(("python -c", "python3 -c", "py -c")):
+                    if _phase_re.search(r'open\s*\([^)]*[\'"]w[\'"]', cmd):
+                        has_modify_calls = True
+                        logger.info("[D21] run_command 含写操作，触发阶段推进: %s", cmd[:80])
+                        break
 
     # 检测 agent 是否调用了只读工具（非写工具，含 run_command）
     has_read_only_calls = bool(last.tool_calls) and not has_modify_calls
@@ -895,6 +1073,8 @@ def _advance_phase(state: AgentState) -> dict:
 
     new_phase = phase
     new_stall = stall_count
+    new_deviation_count = deviation_count
+    new_deviation_reason = deviation_reason
 
     if phase == "gather":
         if has_modify_calls:
@@ -933,6 +1113,9 @@ def _advance_phase(state: AgentState) -> dict:
 
     # "all" 阶段不做推进
 
+    # ── 偏差检测 ──────────────────────────────────────────────
+    new_deviation_count, new_deviation_reason = _detect_deviation(state, new_stall, deviation_count, deviation_reason)
+
     # 混合调用暂存：当 LLM 同时发出子代理调用和普通/危险工具调用时，
     # 将非子代理 tool_calls 暂存到 state._pending_tool_calls，
     # 由 _aggregate_results 读取并恢复到消息流。
@@ -953,7 +1136,12 @@ def _advance_phase(state: AgentState) -> dict:
                     len(subagent_calls), len(other_calls),
                 )
 
-    result = {"_phase": new_phase, "_stall_count": new_stall}
+    result = {
+        "_phase": new_phase,
+        "_stall_count": new_stall,
+        "_deviation_count": new_deviation_count,
+        "_deviation_reason": new_deviation_reason,
+    }
     if pending_calls:
         result["_pending_tool_calls"] = pending_calls
     elif state.get("_pending_tool_calls"):
@@ -1039,7 +1227,68 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
             "APPROVED | tools=%s | decision=approve",
             ", ".join(tc["name"] for tc in dangerous_calls),
         )
-        return {"messages": [], "_approval_next": "tools"}
+
+        # D20: Interrupt 循环检测 — 检测真正的死循环（同一工具+相似参数反复调用）
+        # 而非简单计数（正常连续写操作不应触发）
+        prev_count = state.get("_interrupt_repeat_count", 0)
+        prev_tool_sig = state.get("_interrupt_last_tool_sig", "")
+        # 生成当前调用的签名：工具名+参数摘要（截断避免过长）
+        current_sig = "|".join(
+            f"{tc['name']}:{str(tc.get('args', ''))[:80]}"
+            for tc in dangerous_calls
+        )
+        # 只有与上次签名高度相似时才增加计数（真正的循环）
+        # 简单启发式：工具名集合相同 + 参数有重叠
+        current_tool_names = frozenset(tc["name"] for tc in dangerous_calls)
+        _sig_overlap = False
+        if prev_tool_sig:
+            prev_names = frozenset(part.split(":")[0] for part in prev_tool_sig.split("|"))
+            if current_tool_names == prev_names:
+                _sig_overlap = True
+        repeat_count = prev_count + 1 if _sig_overlap else 1
+        updates: dict = {
+            "_approval_next": "tools",
+            "_interrupt_repeat_count": repeat_count,
+            "_interrupt_last_tool_sig": current_sig,
+        }
+
+        _WARN_THRESHOLD = 5
+        _FORCE_PHASE_THRESHOLD = 8
+
+        if repeat_count >= _FORCE_PHASE_THRESHOLD:
+            # 连续批准过多：强制解除工具限制 + 注入强警告
+            logger.warning(
+                "[D20] Interrupt 循环检测: 连续批准 %d 次，强制解除工具限制",
+                repeat_count,
+            )
+            warn_msg = SystemMessage(
+                content=(
+                    f"[系统警告] 你已经连续 {repeat_count} 次请求审批执行操作，"
+                    "可能陷入了无效循环。请重新审视你的策略：\n"
+                    "1. 你是否在反复尝试同一种失败的方法？\n"
+                    "2. 是否应该换一种完全不同的方式来完成任务？\n"
+                    "3. 如果当前方法不可行，请直接向用户报告困难。\n"
+                    "工具限制已解除，你可以自由选择任何工具。"
+                )
+            )
+            updates["messages"] = [warn_msg]
+            updates["_phase"] = "all"
+            updates["_stall_count"] = 0
+        elif repeat_count >= _WARN_THRESHOLD:
+            # 连续批准较多：注入温和警告
+            logger.info(
+                "[D20] Interrupt 循环检测: 连续批准 %d 次，注入警告",
+                repeat_count,
+            )
+            warn_msg = SystemMessage(
+                content=(
+                    f"[系统提示] 你已经连续 {repeat_count} 次请求审批执行操作。"
+                    "如果你发现当前策略不奏效，请尝试换一种方式。"
+                )
+            )
+            updates["messages"] = [warn_msg]
+
+        return updates
     else:
         # 拒绝：注入拒绝消息，并回退 phase 到 gather（审批拒绝说明不应修改）
         tool_names = ", ".join(tc["name"] for tc in dangerous_calls)
@@ -1047,17 +1296,224 @@ def _interrupt_approval(state: AgentState, config: RunnableConfig) -> dict:
             "REJECTED | tools=%s | decision=reject",
             tool_names,
         )
-        reject_msg = AIMessage(
-            content=f"[人工审批] 以下操作已被拒绝: {tool_names}"
-        )
+        # 为每个被拒绝的 tool_call 生成 ToolMessage(status="error")，
+        # 确保 AIMessage(tool_calls) 的完整性——API 要求每个 tool_call_id
+        # 都有对应的 ToolMessage，否则后续请求会报 400 错误。
+        reject_tool_messages = [
+            ToolMessage(
+                content=f"[人工审批] 操作已被拒绝: {tc['name']}",
+                tool_call_id=tc["id"],
+                name=tc["name"],
+                status="error",
+            )
+            for tc in dangerous_calls
+        ]
         current_phase = state.get("_phase", "gather")
         rollback_phase = "gather" if current_phase in ("modify", "verify") else current_phase
-        return {"messages": [reject_msg], "_approval_next": "agent", "_phase": rollback_phase, "_stall_count": 0}
+        return {"messages": reject_tool_messages, "_approval_next": "agent", "_phase": rollback_phase, "_stall_count": 0}
 
 
 def _route_after_approval(state: AgentState) -> str:
     """interrupt_approval 后路由：根据审批结果决定下一步。"""
     return state.get("_approval_next", "agent")
+
+
+# ── Reflection 节点 ────────────────────────────────────────────
+
+async def _reflect_node(state: AgentState, config: RunnableConfig) -> dict:
+    """反思节点：评估当前工作质量，决定是否需要继续。
+
+    触发条件：agent 在 verify 阶段返回文本（无 tool_calls），
+    且反思次数未超限。
+
+    行为：
+    - 用无工具 LLM 评估工作质量
+    - 通过 → 结束对话
+    - 回退 → 修改 _phase 为 modify，注入反思结论，agent 继续工作
+    """
+    from agent_core.tools import _ctx_llm_ref
+
+    llm = _ctx_llm_ref.get()
+    reflection_count = state.get("_reflection_count", 0) or 0
+
+    if llm is None:
+        return {"_reflection_result": "[反思: 通过]", "_reflection_count": reflection_count + 1}
+
+    plan = state.get("plan", "无计划")
+    phase = state.get("_phase", "gather")
+
+    # 取最近 6 条消息作为反思输入（避免 token 浪费）
+    recent_messages = list(state["messages"][-6:])
+
+    reflection_input = _REFLECTION_PROMPT.format(plan=plan, phase=phase)
+
+    try:
+        planner_llm = llm.bind_tools([])
+        response = await planner_llm.ainvoke(
+            [SystemMessage(content=reflection_input)] + recent_messages,
+            config=config,
+        )
+        result_text = response.content if isinstance(response.content, str) else str(response.content)
+    except Exception as exc:
+        logger.warning("[Reflection] 反思失败: %s，默认通过", exc)
+        result_text = "[反思: 通过]"
+
+    # 判断反思结论
+    needs_rollback = "[反思: 回退]" in result_text
+
+    updates: dict = {
+        "_reflection_result": result_text,
+        "_reflection_count": reflection_count + 1,
+    }
+
+    if needs_rollback:
+        # 回退到 modify 阶段，注入反思结论让 agent 知道需要修复什么
+        reflection_msg = SystemMessage(
+            content=f"[反思评估 - 需要修复]\n{result_text}\n\n"
+            "请根据以上反思结论修复问题，修复完成后重新进入验证阶段。"
+        )
+        updates["messages"] = [reflection_msg]
+        updates["_phase"] = "modify"
+        updates["_stall_count"] = 0
+        updates["_deviation_count"] = 0
+        updates["_deviation_reason"] = ""
+        logger.info("[Reflection] 反思回退: %s", result_text[:100])
+    else:
+        # 通过，检查是否需要补充 JSON 摘要（开发阶段常见问题）
+        needs_json_summary = False
+        json_prompt = ""
+        if phase in ("verify", "modify"):
+            # 检查最近消息中是否包含 JSON 摘要
+            last_ai_content = ""
+            for msg in reversed(state.get("messages", [])):
+                if isinstance(msg, AIMessage) and msg.content:
+                    last_ai_content = str(msg.content)
+                    break
+            if "project_name" not in last_ai_content or "files_created" not in last_ai_content:
+                needs_json_summary = True
+                json_prompt = (
+                    "\n\n⚠️ 你的最终输出中缺少 JSON 摘要。"
+                    "请在回复末尾补充如下格式的 JSON 摘要（放在 ```json 代码块中）：\n"
+                    '```json\n{"project_name": "项目名", "files_created": ["文件1路径"], '
+                    '"tech_stack": "技术栈", "setup_instructions": "安装运行步骤"}\n```'
+                )
+
+        reflection_msg = SystemMessage(
+            content=f"[反思评估 - 通过]\n{result_text}{json_prompt}"
+        )
+        updates["messages"] = [reflection_msg]
+        logger.info("[Reflection] 反思通过%s", " (已追加JSON摘要提示)" if needs_json_summary else "")
+
+    return updates
+
+
+def _route_after_reflect(state: AgentState) -> str:
+    """反思后路由：根据反思结论决定继续还是结束。"""
+    result = state.get("_reflection_result", "")
+    if "[反思: 回退]" in result:
+        return "agent"
+    return END
+
+
+# ── Replanner 节点 ─────────────────────────────────────────────
+
+def _extract_recent_summary(messages: list[BaseMessage], max_messages: int = 4) -> str:
+    """从最近消息中提取执行摘要，供 replanner 使用。"""
+    recent = messages[-max_messages:] if len(messages) > max_messages else list(messages)
+    parts: list[str] = []
+    for msg in recent:
+        if isinstance(msg, AIMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if content:
+                parts.append(f"[AI] {content[:200]}")
+            if msg.tool_calls:
+                tool_names = ", ".join(tc["name"] for tc in msg.tool_calls)
+                parts.append(f"[AI 调用工具] {tool_names}")
+        elif isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            status = " (错误)" if msg.status == "error" else ""
+            parts.append(f"[工具结果{status}] {content[:150]}")
+        elif isinstance(msg, HumanMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            parts.append(f"[用户] {content[:100]}")
+    return "\n".join(parts) if parts else "无最近执行记录"
+
+
+async def _replanner_node(state: AgentState, config: RunnableConfig) -> dict:
+    """计划修正节点：基于执行偏差重新规划。
+
+    触发条件：_deviation_count >= 2（连续工具错误或计划步骤停滞）。
+
+    行为：
+    - 用无工具 LLM 修正计划
+    - 重置偏差计数和停滞计数
+    - 注入修正通知到消息流
+    """
+    from agent_core.tools import _ctx_llm_ref
+
+    llm = _ctx_llm_ref.get()
+
+    if llm is None:
+        return {"_deviation_count": 0, "_deviation_reason": ""}
+
+    original_plan = state.get("plan", "无计划")
+    deviation_reason = state.get("_deviation_reason", "执行偏离原计划")
+    recent_summary = _extract_recent_summary(list(state["messages"]))
+
+    replanner_input = _REPLANNER_PROMPT.format(
+        original_plan=original_plan,
+        deviation_reason=deviation_reason,
+        recent_summary=recent_summary,
+    )
+
+    try:
+        planner_llm = llm.bind_tools([])
+        response = await planner_llm.ainvoke(
+            [HumanMessage(content=replanner_input)],
+            config=config,
+        )
+        new_plan = response.content if isinstance(response.content, str) else str(response.content)
+    except Exception as exc:
+        logger.warning("[Replanner] 重规划失败: %s，保持原计划", exc)
+        new_plan = original_plan
+
+    # 从修正后的计划中提取新阶段
+    new_phase = "gather"
+    phase_match = re.search(r'\[阶段:\s*(gather|modify|verify)\]', new_plan)
+    if phase_match:
+        new_phase = phase_match.group(1)
+
+    # 注入重规划通知
+    replan_msg = SystemMessage(
+        content=f"[计划修正]\n原因: {deviation_reason}\n修正后计划:\n{new_plan}"
+    )
+
+    logger.info("[Replanner] 计划修正: phase=%s, reason=%s", new_phase, deviation_reason[:80])
+
+    return {
+        "plan": new_plan,
+        "_phase": new_phase,
+        "_deviation_count": 0,
+        "_deviation_reason": "",
+        "_stall_count": 0,
+        "messages": [replan_msg],
+    }
+
+
+def _route_after_advance(state: AgentState) -> str | list[Send]:
+    """advance_phase 后路由：先检查偏差，再走原有路由逻辑。
+
+    偏差检测优先级高于反思路由，因为计划层面的问题应先修正，
+    再让 agent 按修正后的计划执行。
+    """
+    deviation_count = state.get("_deviation_count", 0) or 0
+
+    # 偏差阈值：连续 2 次偏差触发重规划
+    if deviation_count >= 2:
+        return "replanner"
+
+    # 无偏差或偏差未达阈值 → 走原有路由
+    return _route_after_agent(state)
 
 
 def create_agent_graph(
@@ -1071,14 +1527,19 @@ def create_agent_graph(
         START → _should_plan
                     ├── plan 非空 → agent（已有计划，直接执行）
                     └── plan 为空 → planner → agent（新请求，先规划再执行）
-                        agent → advance_phase → route_after_agent
-                            ├── 无 tool_calls → END
-                            ├── dispatch_subagent_lg → subagent_dispatcher
-                            │     └── [Send × N] → subagent_worker → aggregate_results → agent
-                            ├── 危险工具 → interrupt_approval
-                            │     ├── approve → tools → agent
-                            │     └── reject → agent
-                            └── 普通工具 → tools → agent
+                        agent → advance_phase → _route_after_advance
+                            ├── deviation_count >= 2 → replanner → agent
+                            └── _route_after_agent
+                                ├── 无 tool_calls + verify阶段 → reflect → _route_after_reflect
+                                │     ├── 通过 → END
+                                │     └── 回退 → agent (phase回退到modify)
+                                ├── 无 tool_calls + 非verify → END
+                                ├── dispatch_subagent_lg → subagent_dispatcher
+                                │     └── [Send × N] → subagent_worker → aggregate_results → agent
+                                ├── 危险工具 → interrupt_approval
+                                │     ├── approve → tools → agent
+                                │     └── reject → agent
+                                └── 普通工具 → tools → agent
 
     Args:
         llm: 绑定了 DeepSeek API 的 ChatOpenAI 实例（支持 reasoning_content）
@@ -1105,7 +1566,7 @@ def create_agent_graph(
     tool_node = ParallelToolNode(tools)
 
     # 上下文视图裁剪器：在注入 LLM 前裁剪消息，state 保持完整
-    from agent_core.context_view import ContextView
+    from agent_core.context_view import ContextView, _ensure_tool_call_integrity
     from agent_core.in_context_compactor import InContextCompactor
     from agent_core.decision_summary import DecisionSummaryExtractor, merge_summaries
     from agent_core.observation_masker import ObservationMasker
@@ -1196,6 +1657,10 @@ def create_agent_graph(
         # 步骤4: InContextCompactor 压缩 — 截断旧的大体积 ToolMessage
         view = _in_context_compactor.compact(view)
 
+        # 步骤4.5: 安全网 — 最终完整性校验，确保 view 中无悬空的 tool_calls
+        # 这是对 ContextView / ObservationMasker / InContextCompactor 的防御性兜底
+        view = _ensure_tool_call_integrity(view)
+
         # 步骤5: 自适应工具选择（P3）— 根据 _phase 过滤工具
         llm_bound = _bind_tools_for_phase(llm, tools, llm_with_tools, phase, stall_count)
 
@@ -1205,6 +1670,11 @@ def create_agent_graph(
         updates: dict = {"messages": [response]}
         if merged != old_summary:
             updates["_compaction_summary"] = merged
+        # D20: agent 节点正常返回时重置 interrupt 循环计数
+        # （非 interrupt 路径说明 Agent 在正常推进，不应累积计数）
+        if not response.tool_calls:
+            updates["_interrupt_repeat_count"] = 0
+            updates["_interrupt_last_tool_sig"] = ""
         return updates
 
     builder = StateGraph(AgentState)
@@ -1218,14 +1688,20 @@ def create_agent_graph(
     builder.add_node("subagent_worker", _subagent_worker)
     builder.add_node("aggregate_results", _aggregate_results)
     builder.add_node("interrupt_approval", _interrupt_approval)
+    builder.add_node("reflect", _reflect_node)
+    builder.add_node("replanner", _replanner_node)
 
     # 边
     # START → 条件路由：有计划直接进 agent，无计划先规划
     builder.add_conditional_edges(START, _should_plan)
     builder.add_edge("planner", "agent")
-    # agent → advance_phase → route_after_agent（P3：先推进阶段，再路由）
+    # agent → advance_phase → _route_after_advance（偏差检测优先，再走原有路由）
     builder.add_edge("agent", "advance_phase")
-    builder.add_conditional_edges("advance_phase", _route_after_agent)
+    builder.add_conditional_edges("advance_phase", _route_after_advance)
+    # replanner 修正计划后回到 agent
+    builder.add_edge("replanner", "agent")
+    # reflect 反思后路由：通过 → END，回退 → agent
+    builder.add_conditional_edges("reflect", _route_after_reflect)
     builder.add_edge("tools", "agent")
     builder.add_edge("todos_inline", "agent")
     builder.add_edge("subagent_worker", "aggregate_results")

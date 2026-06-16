@@ -557,8 +557,10 @@ class AgentService:
         try:
             result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
-            if "</think>" in content:
-                content = content.split("</think>", 1)[1].strip()
+            if not content or not content.strip():
+                return {"status": "failed", "error": "需求分析响应为空"}
+            if "</think" in content:
+                content = content.split("</think", 1)[1].strip()
             json_start = content.find('{')
             json_end = content.rfind('}') + 1
             if json_start != -1 and json_end > json_start:
@@ -594,8 +596,10 @@ class AgentService:
         try:
             result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
-            if "</think>" in content:
-                content = content.split("</think>", 1)[1].strip()
+            if not content or not content.strip():
+                return {"status": "failed", "error": "PRD 响应为空"}
+            if "</think" in content:
+                content = content.split("</think", 1)[1].strip()
             json_start = content.find('{')
             json_end = content.rfind('}') + 1
             if json_start != -1 and json_end > json_start:
@@ -632,8 +636,10 @@ class AgentService:
         try:
             result = await _invoke_lg_async(agent, prompt)
             content = result["output"]
-            if "</think>" in content:
-                content = content.split("</think>", 1)[1].strip()
+            if not content or not content.strip():
+                return {"status": "failed", "error": "成本估算响应为空"}
+            if "</think" in content:
+                content = content.split("</think", 1)[1].strip()
             json_start = content.find('{')
             json_end = content.rfind('}') + 1
             if json_start != -1 and json_end > json_start:
@@ -669,6 +675,20 @@ class AgentService:
         try:
             result = await _invoke_lg_async(agent, prompt, output_subdir="成品")
             content = result["output"]
+
+            # 检查是否有中断（interrupt）
+            if result.get("interrupt"):
+                logger.warning("LG 开发被中断，等待审批: %s", result["interrupt"])
+                return {"status": "failed", "error": "开发被中断，等待人工审批"}
+
+            # 检测空输出
+            if not content or not content.strip():
+                logger.error("LG 开发响应为空")
+                return {"status": "failed", "error": "开发响应为空"}
+
+            # 去除 <think...> 推理内容
+            if "</think" in content:
+                content = content.split("</think", 1)[1].strip()
 
             # 检测 Agent 迭代耗尽
             if "max iterations" in content.lower() or "Agent stopped" in content:

@@ -79,3 +79,16 @@ class TokenTracker:
             for k in ("input", "output", "total"):
                 out[m][k] += r.get(k, 0)
         return dict(out)
+
+    def summary(self) -> str:
+        """返回 token 使用的可读摘要。"""
+        by_model = self.stats_by_model()
+        if not by_model:
+            return "No token usage recorded"
+        parts = []
+        total_all = 0
+        for model, stats in by_model.items():
+            total = stats.get("total", 0)
+            total_all += total
+            parts.append(f"{model}: input={stats.get('input', 0)}, output={stats.get('output', 0)}, total={total}")
+        return f"Total: {total_all} tokens | " + " | ".join(parts)

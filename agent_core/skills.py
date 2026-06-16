@@ -25,6 +25,8 @@ class SkillsLoader:
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
             text = f.read_text(encoding="utf-8")
             meta, body = self._parse_frontmatter(text)
+            if not isinstance(meta, dict):
+                meta = {}
             name = meta.get("name", f.parent.name)
             self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
 

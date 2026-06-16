@@ -202,9 +202,9 @@ def create_subagent_graph(llm, spec: SubagentSpec, checkpointer=None):
 
 
 # 按 (model_name, agent_name) 区分的子图缓存
-# 注意：缓存的是 CompiledGraph，持有对 LLM 与工具的强引用；
-# 长期运行的服务应在切换 LLM / 模型时调用 clear_subgraph_cache() 释放旧实例
-_subgraph_cache: dict[tuple[str, str], object] = {}
+# 带 TTL 过期淘汰，防止长期运行时内存泄漏
+_subgraph_cache: dict[tuple[str, str], tuple[object, float]] = {}
+_SUBGRAPH_CACHE_TTL = 3600.0  # 缓存有效期：1 小时
 
 
 def get_subagent_graph(llm, registry, agent_name: str, checkpointer=None):
@@ -234,6 +234,15 @@ def get_subagent_graph(llm, registry, agent_name: str, checkpointer=None):
     """
     model_name = getattr(llm, "model_name", "") or getattr(llm, "model", "") or "unknown"
     key = (model_name, agent_name)
+
+    # TTL 过期检查
+    import time as _time
+    if key in _subgraph_cache:
+        graph, cached_at = _subgraph_cache[key]
+        if _time.monotonic() - cached_at > _SUBGRAPH_CACHE_TTL:
+            logger.info("[子图缓存] TTL 过期，淘汰: %s/%s", model_name, agent_name)
+            del _subgraph_cache[key]
+
     if key not in _subgraph_cache:
         spec = registry.get(agent_name)
         if spec is None:
@@ -244,10 +253,11 @@ def get_subagent_graph(llm, registry, agent_name: str, checkpointer=None):
         # requirement_analyst 使用 CRAG 子图
         if spec.is_rag:
             from agent_by_langgraph.lg_rag_subagent import create_rag_subagent_graph
-            _subgraph_cache[key] = create_rag_subagent_graph(llm, spec, checkpointer=checkpointer)
+            graph = create_rag_subagent_graph(llm, spec, checkpointer=checkpointer)
         else:
-            _subgraph_cache[key] = create_subagent_graph(llm, spec, checkpointer=checkpointer)
-    return _subgraph_cache[key]
+            graph = create_subagent_graph(llm, spec, checkpointer=checkpointer)
+        _subgraph_cache[key] = (graph, _time.monotonic())
+    return _subgraph_cache[key][0]
 
 
 def clear_subgraph_cache() -> None:

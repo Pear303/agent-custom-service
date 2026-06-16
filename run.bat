@@ -24,18 +24,18 @@ if errorlevel 1 (
 )
 
 REM -- Mode detection --------------------------------------------
-REM 榛樿寮€鍙戞ā寮忥紙鍓嶅悗绔悓鏃跺惎鍔?+ 鎵撳紑娴忚鍣級
-REM 璁?PROD_MODE=true 鍒欏彧鍚姩鍚庣锛堢敓浜фā寮忥級
+REM Default: start frontend + backend, then open browser
+REM Set PROD_MODE=true to start backend only (production)
 if "%PROD_MODE%"=="1"   set PROD_MODE=true
 if "%PROD_MODE%"=="yes" set PROD_MODE=true
 if /i "%PROD_MODE%"=="true" (goto :prod_mode) else (goto :dev_mode)
 
 :dev_mode
 echo.
-echo   [DEV MODE] 姝ｅ湪鍚姩鍓嶅悗绔湇鍔?..
+echo   [DEV MODE] Starting frontend + backend...
 echo.
 
-REM -- 纭繚 npm 渚濊禆宸插畨瑁?------------------------------------
+REM -- Ensure npm dependencies installed -------------------------
 if not exist "frontend\node_modules" (
     echo [..] npm install...
     cd frontend
@@ -43,31 +43,32 @@ if not exist "frontend\node_modules" (
     cd ..
 )
 
-REM -- 鍚姩 Vite 鍓嶇锛堟柊绐楀彛锛?----------------------------------
-echo [..] 鍚姩鍓嶇 Vite (http://localhost:5173)...
+REM -- Start Vite frontend (new window) --------------------------
+echo [..] Starting frontend Vite (http://localhost:5173)...
 start "SmartCS Frontend" cmd /c "cd /d %~dp0frontend && npm run dev"
 
-REM -- 绛夊緟涓€涓嬭 Vite 鍏堣捣鏉?------------------------------------
+REM -- Wait a bit for Vite to start -------------------------------
 timeout /t 3 /nobreak >nul
 
-REM -- 鍚姩鍚庣锛堟柊绐楀彛锛?----------------------------------------
-echo [..] 鍚姩鍚庣 API (http://localhost:8080)...
+REM -- Start backend (new window) ---------------------------------
+echo [..] Starting backend API (http://localhost:8080)...
 start "SmartCS Backend" cmd /c "cd /d %~dp0 && %PYTHON_CMD% -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir=api --reload-dir=agent_by_langgraph --reload-dir=agent_core --no-access-log"
 
-REM -- 鎵撳紑娴忚鍣?-------------------------------------------------
+REM -- Open browser ----------------------------------------------
 timeout /t 2 /nobreak >nul
-echo [OK] 姝ｅ湪鎵撳紑娴忚鍣?..
+echo [OK] Opening browser...
 start http://localhost:5173
 
 echo.
 echo =========================================
-echo   鏈嶅姟姝ｅ湪鍚姩锛岃绋嶅€?..
+echo   Services starting up, please wait...
 echo.
-echo   鍓嶇椤甸潰 : http://localhost:5173
-echo   鍚庣 API  : http://localhost:8080
-echo   API 鏂囨。  : http://localhost:8080/docs
+echo   Frontend page : http://localhost:5173
+echo   Backend API   : http://localhost:8080
+echo   API Docs      : http://localhost:8080/docs
 echo.
-echo   鍏抽棴鍓嶇/鍚庣绐楀彛鍗冲彲鍋滄鏈嶅姟銆?echo =========================================
+echo   Close frontend/backend windows to stop.
+echo =========================================
 echo.
 goto :eof
 

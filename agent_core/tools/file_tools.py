@@ -207,17 +207,21 @@ def read_file(path: str, offset: int = 1, limit: Optional[int] = None) -> str:
 
 class WriteFileArgs(BaseModel):
     """write_file 的参数 schema。"""
-    path: str = Field(default="", description='文件路径（相对于工作区，如 "index.html" 或 "css/style.css"）。必填，不能省略。')
+    path: str = Field(default="", description='文件路径（相对于工作区，如 "index.html" 或 "css/style.css"）。必填，不能省略。也可用 file_path 代替。')
+    file_path: str = Field(default="", description='path 的别名，二者传一个即可。')
     content: str = Field(description='要写入的文件内容')
 
 
 @tool(args_schema=WriteFileArgs)
-def write_file(path: str = "", content: str = "") -> str:
+def write_file(path: str = "", file_path: str = "", content: str = "") -> str:
     """写入文件（覆盖已有内容）。部分编辑请用 edit_file。
     Args:
-        path: 文件路径（相对于工作区，如 \"index.html\" 或 \"css/style.css\"）。必填，不能省略。
+        path: 文件路径（相对于工作区，如 \"index.html\" 或 \"css/style.css\"）。必填，不能省略。也可用 file_path 代替。
+        file_path: path 的别名，二者传一个即可。
         content: 要写入的文件内容
     """
+    # 兼容 LLM 偶尔使用 file_path 而非 path 的情况
+    path = path or file_path
     if not path or not path.strip():
         return (
             "Error: path 参数为空。write_file 必须提供 path 参数，"
@@ -236,7 +240,7 @@ def write_file(path: str = "", content: str = "") -> str:
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding="utf-8")
         display = _display_path(fp, Path(__file__).parent.parent.parent)
-        return f"Successfully wrote {len(content)} characters to {display}"
+        return f"Successfully wrote {len(content)} characters to {display}\n[提示] 文件已成功创建，无需再用 run_command/echo 重写此文件。如需修改请用 edit_file。"
     except PermissionError as e:
         return f"Error: {e}"
     except Exception as e:

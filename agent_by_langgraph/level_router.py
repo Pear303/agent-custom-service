@@ -176,6 +176,13 @@ class LevelRouter:
             logger.info("[LevelRouter] 关键词匹配 → 级别 %d (%s)", level, _LEVEL_CONFIGS[level].label)
             return _LEVEL_CONFIGS[level]
 
+        # 步骤1.5: 短输入快速路径（≤30 字且无关键词匹配，默认级别 3，跳过 LLM）
+        _SHORT_INPUT_THRESHOLD = 30
+        if len(user_input) <= _SHORT_INPUT_THRESHOLD:
+            default = TaskLevel.SCRIPT
+            logger.info("[LevelRouter] 短输入快速路径 → 级别 %d (%s)", default, _LEVEL_CONFIGS[default].label)
+            return _LEVEL_CONFIGS[default]
+
         # 步骤2: LLM 分类（如果可用）
         if self.llm is not None:
             level = self._llm_classify(user_input)

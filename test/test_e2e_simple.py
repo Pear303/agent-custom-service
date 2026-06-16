@@ -39,9 +39,17 @@ from typing import Any
 # Windows 编码修复（必须在 logging.basicConfig 之前，否则 handler 使用旧编码）
 if sys.platform == "win32":
     os.system('chcp 65001 >nul 2>&1')
-    sys.stdin.reconfigure(encoding="utf-8")
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    # 设置控制台输出代码页为 UTF-8（解决 PowerShell 中文乱码）
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # 配置日志
 logging.basicConfig(
@@ -430,7 +438,11 @@ DEVELOPER_PROMPT = """你是全栈开发工程师，负责根据 PRD 和需求�
 完成所有文件后，输出一个 JSON 摘要，格式如下：
 {{"project_name": "项目名", "files_created": ["文件1路径", "文件2路径"], "tech_stack": "技术栈", "setup_instructions": "安装运行步骤"}}
 
-⚠️ 重要：先使用 write_file 工具创建所有文件，最后再输出 JSON 摘要。不要把代码内容放在 JSON 中。"""
+⚠️ 关键要求：
+1. 先使用 write_file 工具创建所有文件
+2. 最后一条消息必须且只能是上述格式的 JSON 摘要（不要包含其他解释文字）
+3. JSON 摘要必须放在 ```json 代码块中
+4. 不要把代码内容放在 JSON 中"""
 
 
 def _extract_json(content: str) -> dict | None:

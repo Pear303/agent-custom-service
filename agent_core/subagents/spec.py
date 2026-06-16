@@ -37,7 +37,7 @@ class SubagentSpec:
                     f"设置 SUBAGENT_STRICT_TOOL_CHECK=false 可降级为警告。"
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "[D8] 子代理 '%s' 包含危险工具: %s。"
                     "子代理子图无 interrupt 审批门，这些工具将直接执行。"
                     "设置 SUBAGENT_STRICT_TOOL_CHECK=true 可改为抛出异常。",

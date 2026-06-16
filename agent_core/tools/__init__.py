@@ -1,7 +1,6 @@
 """agent_core.tools: 工具层统一 re-export。
 
-保持与原 agent.lc_tools 相同的公开 API，
-内部按职责拆分为独立模块。
+内部按职责拆分为独立模块
 """
 
 # ContextVar + set/clear

@@ -9,15 +9,8 @@ import threading
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
-# D15: Windows 控制台 UTF-8 编码修复，防止中文乱码
-if sys.platform == "win32":
-    try:
-        # 设置控制台代码页为 UTF-8，确保 PowerShell/CMD 正确显示中文
-        os.system('chcp 65001 >nul 2>&1')
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, OSError):
-        pass
+# 注意：Windows 控制台 UTF-8 编码修复已统一到 agent_lg.py 入口文件，
+# 此处不再重复处理，避免多次调用 chcp 65001
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -212,62 +205,29 @@ class LGAgent:
         )
         system_prompt = ctx.build_system_prompt()
 
-        # D1: 注入当前工作目录信息，让 Agent 知道文件操作的根路径
-        # 避免 Agent 不知道 CWD 而反复搜索浪费 token
+        # D1: 注入当前工作目录信息 + 工具约束（合并精简，减少重复）
         workspace = _build_workspace(self.root, user_id, ticket_id)
-        cwd_hint = (
-            f"\n\n---\n\n# Current Working Directory\n\n"
-            f"你的当前工作目录（CWD）是: `{workspace}`\n\n"
-            f"**关键规则**：\n"
-            f"1. 所有文件操作（read_file, write_file, edit_file）的路径都相对于此目录解析\n"
-            f"2. 例如：`read_file('src/app.py')` 实际读取 `{workspace}/src/app.py`\n"
-            f"3. **禁止**使用 `pwd`、`cd`、`dir` 等命令探测工作目录 — 你已经知道 CWD\n"
-            f"4. **禁止**使用 `..\\` 或 `../` 等相对路径跳出工作目录\n"
-            f"5. **禁止**使用绝对路径 — 所有路径都应相对于 CWD\n"
-            f"6. run_command 自动在 CWD 下执行，无需手动 cd\n"
-            f"7. 如果需要查看目录内容，使用 `glob_tool` 而非 `dir` 命令\n"
-            f"8. **禁止**使用 `copy`、`move`、`mkdir`、`del`、`rm` 等 shell 命令操作文件 — "
-            f"请使用 `write_file`（创建/覆盖）、`edit_file`（编辑）、`read_file`（读取）、"
-            f"`glob_tool`（查找）等专用工具，它们会自动处理路径解析和工作区约束\n"
-            f"9. **禁止**在 run_command 中使用绝对路径执行 Python 脚本 — "
-            f"使用 `python 相对路径` 即可，run_command 自动在 CWD 下执行"
+        cwd_and_constraints = (
+            f"\n\n---\n\n# 工作目录与工具约束\n\n"
+            f"## 工作目录\n"
+            f"CWD: `{workspace}`\n"
+            f"- 文件操作路径相对于此目录解析（如 `read_file('src/app.py')` → `{workspace}/src/app.py`）\n"
+            f"- run_command 自动在 CWD 下执行，无需手动 cd\n\n"
+            f"## 禁止行为\n"
+            f"- 禁止使用 `pwd`/`cd`/`dir`/`ls` 探测目录 — 你已知 CWD，用 `glob_tool` 查看内容\n"
+            f"- 禁止使用 `copy`/`move`/`mkdir`/`del`/`rm` 等 shell 命令操作文件 — 用专用工具\n"
+            f"- 禁止使用绝对路径或 `../` 跳出工作目录\n"
+            f"- 禁止通过 `python -c \"open(...,'w')...\"` 在 run_command 中写文件 — 用 write_file/edit_file\n\n"
+            f"## 工具使用要点\n"
+            f"- **update_todos**: 只在关键里程碑更新，不要每改一个文件就更新\n"
+            f"- **read_file**: 优先用 offset/limit 读取大文件关键部分\n"
+            f"- **dispatch_subagent_lg**: gather 阶段只能派遣只读子代理\n"
+            f"- **写后必审**: write_file 后用 read_file 检查内容，不要用 run_command 重写同一文件\n"
+            f"- **跑后必修**: run_command 失败后用 edit_file 精准修复，不要重写整个文件\n"
+            f"- **复杂任务分治**: 3+ 文件时考虑派遣子代理并行处理\n"
+            f"- **gather 不跳过**: 先用 glob_tool/read_file 了解上下文再写代码"
         )
-        system_prompt += cwd_hint
-
-        # D13: 约束 update_todos 使用频率，减少无效 token 消耗
-        todo_constraint = (
-            "\n\n---\n\n# 工具使用约束\n\n"
-            "- **update_todos**: 只在关键里程碑更新（如：开始任务、完成一个主要步骤、遇到阻塞），"
-            "不要每修改一个文件就更新一次。每次修改后更新 todo 列表是浪费 token 的行为。\n"
-            "- **run_command**: 你已在正确的工作目录下，无需使用 pwd/cd/dir 探测路径。\n"
-            "- **read_file**: 优先使用 offset/limit 参数读取大文件的关键部分，而非整个文件。\n"
-            "- **dispatch_subagent_lg**: gather（信息收集）阶段只能派遣只读子代理，"
-            "需要修改文件的子代理请等待进入 modify 阶段后再派遣。"
-        )
-        system_prompt += todo_constraint
-
-        # 工具使用最佳实践：引导 Agent 形成 read→write→edit→run 迭代循环
-        tool_best_practices = (
-            "\n\n---\n\n# 工具使用最佳实践\n\n"
-            "## 写后必审\n"
-            "用 write_file 创建文件后，用 read_file 检查内容是否正确写入，"
-            "特别是检查：缩进、编码、关键函数定义是否完整。\n\n"
-            "## 跑后必修\n"
-            "用 run_command 运行测试后，如果失败：\n"
-            "1. 仔细阅读错误信息\n"
-            "2. 用 read_file 查看相关代码\n"
-            "3. 用 edit_file 精准修复（不要用 write_file 重写整个文件）\n"
-            "4. 再次 run_command 验证修复\n\n"
-            "## 复杂任务分治\n"
-            "当任务涉及 3 个以上文件时，考虑用 dispatch_subagent_lg 派遣子代理并行处理：\n"
-            "- engine_executor: 可读写执行，适合创建/修改代码文件\n"
-            "- web_researcher: 只读+网络，适合查资料\n"
-            "- validator: 只读校验，适合验证结果\n\n"
-            "## gather 阶段不要跳过\n"
-            "进入 gather 阶段时，先用 glob_tool 查看目录结构、read_file 查看已有文件，"
-            "充分了解上下文后再动手写代码。直接跳到写代码容易遗漏需求。"
-        )
-        system_prompt += tool_best_practices
+        system_prompt += cwd_and_constraints
 
         # 初始化 LangGraph Checkpointer（SQLite 持久化）
         # 启用后支持：状态持久化、时间旅行调试、断点续跑
@@ -304,6 +264,42 @@ class LGAgent:
             or getattr(self, '_checkpointer_db_path', None) is not None
         )
 
+    def _ensure_repl_loop(self):
+        """确保 REPL 持久事件循环已创建并就绪（线程安全）。
+
+        持久事件循环用于在 REPL 的同步上下文中执行异步 ainvoke，
+        避免 asyncio.run() 每次创建新事件循环导致 aiosqlite 连接失效。
+        """
+        import asyncio
+        import threading
+
+        if hasattr(self, '_repl_loop') and self._repl_loop is not None and not self._repl_loop.is_closed():
+            return  # 已创建且运行中
+
+        with self._invoke_lock:
+            # 双重检查
+            if hasattr(self, '_repl_loop') and self._repl_loop is not None and not self._repl_loop.is_closed():
+                return
+
+            self._repl_loop_ready = threading.Event()
+            self._repl_loop = asyncio.new_event_loop()
+
+            def _loop_runner(loop, ready_event):
+                asyncio.set_event_loop(loop)
+                ready_event.set()  # 通知主线程事件循环已就绪
+                loop.run_forever()
+
+            self._repl_thread = threading.Thread(
+                target=_loop_runner,
+                args=(self._repl_loop, self._repl_loop_ready),
+                daemon=True,
+                name="lg-agent-repl-loop",
+            )
+            self._repl_thread.start()
+            # 等待事件循环就绪（最多 5 秒）
+            if not self._repl_loop_ready.wait(timeout=5):
+                raise RuntimeError("REPL 持久事件循环启动超时")
+
     def close(self) -> None:
         """释放资源：关闭 Checkpointer 的 SQLite 连接。
 
@@ -312,17 +308,21 @@ class LGAgent:
         """
         try:
             self._close_checkpointer_ctx("_checkpointer_ctx", "主 Checkpointer")
-
-            # 清理子代理 checkpointer 缓存
-            from agent_by_langgraph.lg_graph import _sub_checkpointer_cache, _sub_checkpointer_lock
-            with _sub_checkpointer_lock:
-                if self.user_id and self.user_id in _sub_checkpointer_cache:
-                    sub_ctx, _ = _sub_checkpointer_cache.pop(self.user_id)
-                    self._close_checkpointer_ctx_obj(sub_ctx, f"子代理 Checkpointer (user_id={self.user_id})")
+            # 子代理已改用 MemorySaver，无需清理 SQLite 缓存
         except (ImportError, AttributeError):
             # Python 关闭期间 sys.meta_path 可能为 None，import 会失败；
             # 属性可能已被 GC 回收。静默跳过即可。
             pass
+
+        # 关闭 REPL 持久事件循环
+        if hasattr(self, '_repl_loop') and self._repl_loop is not None and not self._repl_loop.is_closed():
+            try:
+                self._repl_loop.call_soon_threadsafe(self._repl_loop.stop)
+                if hasattr(self, '_repl_thread') and self._repl_thread.is_alive():
+                    self._repl_thread.join(timeout=5)
+                self._repl_loop.close()
+            except RuntimeError:
+                pass  # 事件循环可能正在运行中，忽略关闭错误
 
     @property
     def checkpointer_ready(self) -> bool:
@@ -336,7 +336,11 @@ class LGAgent:
 
     @staticmethod
     def _close_checkpointer_ctx_obj(ctx, label: str) -> None:
-        """可靠关闭一个 AsyncSqliteSaver 的 async context manager。"""
+        """可靠关闭一个 AsyncSqliteSaver 的 async context manager。
+
+        优先使用 asyncio 关闭；若 Python 解释器关闭阶段 asyncio 不可用，
+        则回退到直接访问底层 sqlite3 连接进行同步关闭。
+        """
         if ctx is None:
             return
         try:
@@ -361,6 +365,26 @@ class LGAgent:
                 asyncio.run(_do_close())
 
             logger.info("[Checkpointer] %s SQLite 连接已关闭", label)
+        except (ImportError, AttributeError):
+            # Python 关闭期间 asyncio 可能已被 GC 回收（sys.modules 中为 None）
+            # 回退到同步关闭：直接访问底层 sqlite3 连接
+            try:
+                saver = getattr(ctx, '_obj', None) or getattr(ctx, 'obj', None)
+                if saver is None:
+                    # 尝试从 __wrapped__ 或其他包装属性获取
+                    for attr in ('_obj', 'obj', '__wrapped__', 'saver'):
+                        saver = getattr(ctx, attr, None)
+                        if saver is not None:
+                            break
+                if saver is not None:
+                    conn = getattr(saver, 'conn', None) or getattr(saver, '_conn', None)
+                    if conn is not None:
+                        conn.close()
+                        logger.info("[Checkpointer] %s SQLite 连接已同步关闭（回退）", label)
+                        return
+                logger.debug("[Checkpointer] %s 无法获取底层连接，跳过关闭", label)
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("[Checkpointer] 关闭 %s SQLite 连接时出错: %s", label, exc)
 
@@ -437,9 +461,23 @@ class LGAgent:
 
         注意：由于节点函数已改为 async def，需要用 asyncio.run() 包装 ainvoke。
         """
+        # 预初始化 checkpointer：延迟到首次 ainvoke 时在同一个 asyncio.run() 中完成。
+        # 不在此处调用 asyncio.run()，因为：
+        # 1. AsyncSqliteSaver 内部的 aiosqlite 连接线程与创建时的事件循环绑定
+        # 2. asyncio.run() 每次创建新事件循环，第二次调用时旧连接线程已死
+        # 3. 会导致 RuntimeError: threads can only be started once
+        # 改为在 _invoke_with_checkpointer 内部首次调用时初始化，确保同一事件循环。
+
+        # Windows 终端 emoji 兼容：如果 stdout 编码不支持 emoji，替换提示符
+        _repl_prompt = "You🫅 : "
+        try:
+            _repl_prompt.encode(sys.stdout.encoding or "utf-8")
+        except UnicodeEncodeError:
+            _repl_prompt = "You> "
+
         while True:
             try:
-                user_input = input("You🫅 : ")
+                user_input = input(_repl_prompt)
             except (EOFError, KeyboardInterrupt):
                 print("\n再见！")
                 break
@@ -512,14 +550,14 @@ class LGAgent:
                 user_msg.metadata = {"milestone": True}
                 input_state = {"messages": [user_msg]}
 
-            # 节点函数为 async def，需要用 asyncio.run 包装 ainvoke
-            # REPL 场景下不会有正在运行的事件循环，直接用 asyncio.run()
-            # 如果在已有事件循环中（不应出现在 REPL），使用新线程隔离
+            # 使用持久事件循环执行 ainvoke，避免 AsyncSqliteSaver 的 aiosqlite
+            # 连接线程因事件循环销毁而失效（RuntimeError: threads can only be started once）。
+            # 首次创建事件循环后保持运行，后续 REPL 轮次复用同一循环。
+            self._ensure_repl_loop()
+
             import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+            from agent_by_langgraph.context_var_manager import restore as _restore_ctx
+            ctx_snap = self._ctx_snapshot
 
             async def _invoke_with_checkpointer():
                 """执行 ainvoke，自动处理 interrupt 恢复。
@@ -528,6 +566,8 @@ class LGAgent:
                 需要用 Command(resume="approve") 恢复执行。
                 此循环自动批准所有 interrupt，直到图正常结束。
                 """
+                # 在持久事件循环中恢复 ContextVar
+                _restore_ctx(ctx_snap)
                 from langgraph.types import Command
                 await self._ensure_checkpointer()
                 # _ensure_checkpointer 可能重新编译图，需更新 config 中的回调
@@ -536,8 +576,17 @@ class LGAgent:
                 config["configurable"]["__has_checkpointer__"] = self.checkpointer_ready
                 current_input = input_state
                 max_interrupt_retries = 30
-                for _ in range(max_interrupt_retries):
-                    result = await self.graph.ainvoke(current_input, config=config)
+                _TASK_TIMEOUT = 180.0  # 单次任务总超时（秒）
+                for _interrupt_idx in range(max_interrupt_retries):
+                    try:
+                        result = await asyncio.wait_for(
+                            self.graph.ainvoke(current_input, config=config),
+                            timeout=_TASK_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[超时] 任务执行超过 %.0f 秒，强制停止", _TASK_TIMEOUT)
+                        result = {"messages": [AIMessage(content="[超时] 任务执行时间过长，已自动停止。请简化任务或分步执行。")]}
+                        break
                     # 用 aget_state 检查是否有 pending interrupt（比消息内容检测更可靠）
                     has_interrupt = False
                     if _will_have_checkpointer:
@@ -571,22 +620,10 @@ class LGAgent:
                         break
                 return result
 
-            if loop and loop.is_running():
-                # 已在事件循环中（不应出现在 REPL，但防御性处理）
-                # 使用新线程运行 asyncio.run()，避免嵌套事件循环
-                # 同时在新线程中恢复 ContextVar 快照
-                from agent_by_langgraph.context_var_manager import restore as _restore_ctx
-                ctx_snap = self._ctx_snapshot
-
-                def _run_in_thread():
-                    _restore_ctx(ctx_snap)
-                    return asyncio.run(_invoke_with_checkpointer())
-
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    result = pool.submit(_run_in_thread).result()
-            else:
-                result = asyncio.run(_invoke_with_checkpointer())
+            # 在持久事件循环中提交协程并等待结果
+            import concurrent.futures
+            future = asyncio.run_coroutine_threadsafe(_invoke_with_checkpointer(), self._repl_loop)
+            result = future.result(timeout=300)  # 总超时 5 分钟
             print()  # 流式结束换行
 
             messages = result["messages"]
@@ -649,29 +686,26 @@ class LGAgent:
 
             # 启用 WAL 模式：写操作不阻塞读，高并发下性能显著提升
             try:
-                await checkpointer.db.execute("PRAGMA journal_mode=WAL")
-                await checkpointer.db.execute("PRAGMA busy_timeout=5000")
-                logger.info("[Checkpointer] WAL 模式已启用: %s", self._checkpointer_db_path)
+                db = getattr(checkpointer, 'db', None) or getattr(checkpointer, '_db', None)
+                if db is not None:
+                    await db.execute("PRAGMA journal_mode=WAL")
+                    await db.execute("PRAGMA busy_timeout=5000")
+                    logger.info("[Checkpointer] WAL 模式已启用: %s", self._checkpointer_db_path)
+                else:
+                    logger.info("[Checkpointer] 无法获取数据库连接，跳过 WAL 模式设置")
             except Exception as wal_exc:
-                logger.warning("[Checkpointer] WAL 模式设置失败（不影响功能）: %s", wal_exc)
-
-            # 保存旧图的回调列表，确保重新编译后不丢失
-            old_callbacks = list(getattr(self.graph, '_lg_llm_callbacks', []))
+                logger.info("[Checkpointer] WAL 模式设置失败（不影响功能）: %s", wal_exc)
 
             # 重新编译图以注入 checkpointer
+            # 新图已自带 TokenTrackerCallback，无需合并旧的
+            # per-invoke 回调（StreamHandler, ReasoningCollector）在每轮 ainvoke 时
+            # 由 _invoke_with_checkpointer() 重新设置到 config["callbacks"]，
+            # 不应存储到 _lg_llm_callbacks 中（避免过期引用和内存泄漏）
             self.graph = create_agent_graph(
                 self.llm, self.tools, self._system_prompt,
                 llm_callbacks=[TokenTrackerCallback(self.token_tracker, self.model)],
                 checkpointer=checkpointer,
             )
-
-            # 合并旧回调到新图（避免丢失 run() 中添加的 per-invoke 回调引用）
-            new_callbacks = list(getattr(self.graph, '_lg_llm_callbacks', []))
-            # 保留旧图中非 TokenTrackerCallback 的回调（如 ReasoningCollector、StreamHandler）
-            for cb in old_callbacks:
-                if not isinstance(cb, TokenTrackerCallback) and cb not in new_callbacks:
-                    new_callbacks.append(cb)
-            self.graph._lg_llm_callbacks = new_callbacks
 
             self._checkpointer_initialized = True
             logger.info("[Checkpointer] AsyncSqliteSaver 延迟初始化成功: %s", self._checkpointer_db_path)
@@ -731,6 +765,22 @@ class LGAgent:
         # DeepSeek thinking mode 必须在后续请求中原样回传 reasoning_content
         last_ai_msg: AIMessage | None = None
 
+        # 检查 checkpointer 是否在另一个事件循环中初始化
+        # 如果是，需要在新事件循环中重新初始化（关闭旧的，创建新的）
+        if self.checkpointer_ready:
+            import asyncio
+            current_loop = asyncio.get_running_loop()
+            repl_loop = getattr(self, '_repl_loop', None)
+            if repl_loop is not None and repl_loop is not current_loop:
+                # checkpointer 在持久事件循环中初始化，但当前在不同事件循环
+                # 需要关闭旧 checkpointer 并重新初始化
+                logger.warning(
+                    "[arun_stream] 事件循环不匹配，重新初始化 checkpointer"
+                )
+                self._close_checkpointer_ctx("_checkpointer_ctx", "主 Checkpointer")
+                self._checkpointer_initialized = False
+                self._checkpointer_failed = False
+
         # 延迟初始化 checkpointer（确保在正确的事件循环中）
         await self._ensure_checkpointer()
         # _ensure_checkpointer 可能重新编译图，需更新 config 中的回调
@@ -739,9 +789,18 @@ class LGAgent:
 
         # 使用 astream_events 流式输出，自动处理 interrupt 恢复
         from langgraph.types import Command
+        import time as _time
         current_input = input_state
         max_interrupt_retries = 30
+        _TASK_TIMEOUT = 180.0  # 单次任务总超时（秒）
+        _start_time = _time.monotonic()
         for _interrupt_retry in range(max_interrupt_retries):
+            # 超时检查
+            if _time.monotonic() - _start_time > _TASK_TIMEOUT:
+                logger.warning("[超时] arun_stream 任务执行超过 %.0f 秒，强制停止", _TASK_TIMEOUT)
+                yield "\n\n[超时] 任务执行时间过长，已自动停止。请简化任务或分步执行。"
+                break
+
             found_interrupt = False
             async for event in self.graph.astream_events(
                 current_input,
@@ -761,6 +820,11 @@ class LGAgent:
                     output = event.get("data", {}).get("output")
                     if isinstance(output, AIMessage):
                         last_ai_msg = output
+                # on_tool_start: 工具开始执行，输出进度提示（不计入 full_reply）
+                elif kind == "on_tool_start":
+                    tool_name = event.get("name", "")
+                    if tool_name:
+                        yield f"\n[执行: {tool_name}]\n"
 
             # 检查是否有 pending interrupt 需要恢复
             # interrupt 后 astream_events 结束，需要检查最终状态

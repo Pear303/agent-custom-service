@@ -78,8 +78,15 @@ class ParallelToolNode:
         if not messages:
             return {"messages": []}
 
-        last_msg = messages[-1]
-        if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+        # 查找最后一条 AIMessage(tool_calls)，而非只看 messages[-1]
+        # 因为 interrupt_approval 等节点可能在 AIMessage(tool_calls) 之后
+        # 插入了 SystemMessage，导致 messages[-1] 不是 AIMessage
+        last_msg = None
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                last_msg = msg
+                break
+        if last_msg is None:
             return {"messages": []}
 
         tool_calls = last_msg.tool_calls
@@ -174,8 +181,13 @@ class ParallelToolNode:
         if not messages:
             return {"messages": []}
 
-        last_msg = messages[-1]
-        if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+        # 查找最后一条 AIMessage(tool_calls)，而非只看 messages[-1]
+        last_msg = None
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                last_msg = msg
+                break
+        if last_msg is None:
             return {"messages": []}
 
         tool_calls = last_msg.tool_calls

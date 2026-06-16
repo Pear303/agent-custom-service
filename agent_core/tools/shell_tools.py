@@ -65,6 +65,26 @@ def run_command(command: str) -> str:
             f"这些工具会自动处理路径解析和工作区约束。"
         )
 
+    # D18: 检测 python -c / python3 -c 中的文件写操作
+    # Agent 可能用 `python -c "with open('x','w')..."` 绕过 write_file 审批
+    # 只检测最明显的模式（python -c + open('w')），避免误杀 pip install 等合法命令
+    import re as _re
+    _cmd_lower = command.strip().lower()
+    if _cmd_lower.startswith(("python -c", "python3 -c", "py -c")):
+        _write_in_python_c = [
+            r'open\s*\([^)]*[\'"]w[\'"]',       # open(..., 'w')
+            r'with\s+open\s*\([^)]*[\'"]w[\'"]', # with open(..., 'w')
+        ]
+        for _pat in _write_in_python_c:
+            if _re.search(_pat, command):
+                return (
+                    "Error: 检测到通过 python -c 执行文件写操作，这违反了工具使用规则。\n"
+                    "请使用专用工具：\n"
+                    "- 创建/覆盖文件 → write_file(path, content)\n"
+                    "- 编辑文件 → edit_file(path, old, new)\n"
+                    "这些工具会自动处理路径解析和工作区约束，且受安全审批保护。"
+                )
+
     # Windows 下设置子进程使用 UTF-8 输出
     env = os.environ.copy()
     if sys.platform == "win32":

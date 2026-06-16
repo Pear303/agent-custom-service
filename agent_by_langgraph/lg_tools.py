@@ -81,7 +81,7 @@ def make_subagent_tools(spec_tool_names: tuple[str, ...]) -> list:
 
 
 @tool
-def dispatch_subagent_lg(agent_name: str, task: str) -> str:
+async def dispatch_subagent_lg(agent_name: str, task: str) -> str:
     """派遣子代理独立处理任务（LangGraph StateGraph 实现）。
 
     当 LLM 在同一帧发出多个 dispatch_subagent_lg 调用时，
@@ -156,7 +156,7 @@ def dispatch_subagent_lg(agent_name: str, task: str) -> str:
                 "rag_context": "",
                 "needs_web_fallback": False,
             })
-        result = subgraph.invoke(sub_input)  # fallback 路径无 checkpointer，不传 config
+        result = await subgraph.ainvoke(sub_input)  # fallback 路径无 checkpointer，不传 config
     except Exception as exc:
         return f"Error: subagent '{agent_name}' raised: {exc}"
 

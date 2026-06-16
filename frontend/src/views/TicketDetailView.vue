@@ -164,8 +164,28 @@ const progressPct = computed(() => {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-async function loadDetail() {
-  await ticketStore.fetchTicketDetail(props.id)
+// 工单终态，无需继续轮询
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'development_completed'])
+
+async function loadDetail(silent = false) {
+  await ticketStore.fetchTicketDetail(props.id, silent)
+}
+
+// 轮询刷新：静默模式，不触发 loading 状态
+function pollDetail() {
+  // 工单已到终态，停止轮询
+  if (ticket.value && TERMINAL_STATUSES.has(ticket.value.status)) {
+    stopPolling()
+    return
+  }
+  loadDetail(true)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
 }
 
 async function handleStartDev() {
@@ -174,6 +194,8 @@ async function handleStartDev() {
     if (result.status === 'developing') {
       toastStore.show('开发已启动，正在生成代码...')
       await loadDetail()
+      // 重新开始轮询（开发中状态需要持续更新）
+      if (!pollTimer) pollTimer = setInterval(pollDetail, 5000)
     } else {
       toastStore.show(result.error || '启动开发失败', 'error')
     }
@@ -188,6 +210,8 @@ async function handleRetry() {
     if (result.status === 'queued') {
       toastStore.show('工单已重新提交，正在排队处理...')
       await loadDetail()
+      // 重新开始轮询（重试后状态会变化）
+      if (!pollTimer) pollTimer = setInterval(pollDetail, 5000)
     } else {
       toastStore.show(result.error || '重试失败', 'error')
     }
@@ -216,14 +240,14 @@ async function handleRestoreLocal() {
   }
 }
 
-// 进入页面加载详情，每 5 秒轮询更新
+// 进入页面加载详情（首次带 loading），然后静默轮询
 onMounted(() => {
   loadDetail()
-  pollTimer = setInterval(loadDetail, 5000)
+  pollTimer = setInterval(pollDetail, 5000)
 })
 
 // 离开页面停止轮询
 onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
+  stopPolling()
 })
 </script>

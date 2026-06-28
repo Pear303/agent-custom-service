@@ -40,6 +40,12 @@ fix_slides.py
 shrink_slides.py
 test-browser.js
 
+# Dify 源代码（本地部署引用，非本项目代码）
+dify-main/
+
+# 测试临时产物
+*_result.json
+
 # ── 第三方技能（版权限制，不随仓库分发） ──
 # Anthropic 专有（pdf/pptx/xlsx 为 AI 工具内建，不可提取分发）
 skills/pdf/

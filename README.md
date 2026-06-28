@@ -23,20 +23,20 @@ npm install
 npm run build              # 产出 frontend/dist/
 cd ..
 
-# 启动服务 → http://localhost:8080
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
+# 启动服务 → http://localhost:8000
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 前端开发模式（另开终端）
 cd frontend; npm run dev   # Vite → http://localhost:5173
 $env:DEV_MODE="true"
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8080 --reload
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 或使用 CLI 交互模式
 python agent.py
-
-# 打开dify工作界面
-localhost/app
 ```
+
+> **Dify 集成说明**：本项目可通过 `DIFY_BASE_URL` / `DIFY_API_KEY` 连接到单独部署的 Dify 服务。
+> 如需搭建 Dify，请参考 [Dify 官方文档](https://docs.dify.ai) 部署，不包含在本仓库中。
 
 ## 项目结构
 
@@ -237,3 +237,36 @@ npx clawhub install word-docx         # Word 文档
 | `SERVICE_PORT` | `8000` | 服务监听端口 |
 | `SESSION_TIMEOUT_MINUTES` | `30` | 会话超时时间（分钟） |
 | `MAX_SESSIONS` | `1000` | 最大并发会话数 |
+
+## Docker 部署
+
+```bash
+docker-compose up -d
+# 服务运行在 http://localhost:8000
+```
+
+## 技术栈
+
+| 层 | 技术 |
+|----|------|
+| Agent 引擎 | LangGraph + LangChain Core |
+| LLM | DeepSeek / 智谱 AI |
+| 后端框架 | FastAPI + SSE 流式 |
+| 数据存储 | SQLite (aiosqlite) |
+| 向量存储 | ChromaDB |
+| RAG | sentence-transformers |
+| 前端 | Vue 3 + Pinia + Vue Router + Vite |
+
+## 运行测试
+
+```bash
+pytest test/ -v
+```
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。请确保代码通过现有测试。

@@ -40,6 +40,12 @@ fix_slides.py
 shrink_slides.py
 test-browser.js
 
+# Dify 源代码（本地部署引用，非本项目代码）
+dify-main/
+
+# 测试临时产物
+*_result.json
+
 # ── 第三方技能（版权限制，不随仓库分发） ──
 # Anthropic 专有（pdf/pptx/xlsx 为 AI 工具内建，不可提取分发）
 skills/pdf/
@@ -59,7 +65,15 @@ skills/word-docx*/
 # 文本向量化
 model/
 embeddings/
+agent/
 data/
 vector_store/
 requirements.txt.new
 .claude/skills/ui-ux-pro-max-0.1.0/SKILL.md
+
+# 隐私 / 课程报告
+开源技术与应用_课程报告_v2.docx
+开源技术与应用_课程报告.docx
+gen_report.py
+_scan_quotes.py
+_fix_quotes.py

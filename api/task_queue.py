@@ -78,10 +78,10 @@ class TaskQueue:
                     logger.error("[%s] 处理工单 %s 失败: %s", name, ticket_id, e, exc_info=True)
                     try:
                         await self.db.update_ticket_status(ticket_id, "failed", error=str(e))
-                    except Exception:
-                        pass
-                finally:
-                    self.queue.task_done()
+                    except Exception as db_err:
+                        logger.error("[%s] 更新工单 %s 状态为 failed 失败: %s", name, ticket_id, db_err, exc_info=True)
+                    finally:
+                        self.queue.task_done()
 
     async def _process_ticket(self, ticket_id: str):
         """处理单个工单的三阶段工作流"""

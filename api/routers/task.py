@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from ..schemas.task import RequirementRequest
 from ..utils.file_manager import _clean_output_path
@@ -65,13 +65,13 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             }
         except Exception as exc:
             logger.error("工单提交失败: %s", exc, exc_info=True)
-            return {"status": "error", "error": str(exc)}
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @router.get("/task/{ticket_id}/status")
     async def get_ticket_status(ticket_id: str):
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"error": "工单不存在"}
+            raise HTTPException(status_code=404, detail="工单不存在")
         return {
             "ticket_id": ticket["ticket_id"],
             "user_id": ticket["user_id"],
@@ -107,9 +107,9 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
     async def start_development(ticket_id: str):
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"error": "工单不存在"}
+            raise HTTPException(status_code=404, detail="工单不存在")
         if ticket["status"] not in ("pending_development", "development_failed"):
-            return {"error": f"当前状态 ({ticket['status']}) 不允许开始开发"}
+            raise HTTPException(status_code=400, detail=f"当前状态 ({ticket['status']}) 不允许开始开发")
 
         try:
             logger.info("开始开发工单: %s", ticket_id)
@@ -118,15 +118,15 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             return {"status": "developing", "message": "开发已启动"}
         except Exception as exc:
             logger.error("启动开发失败: %s", exc, exc_info=True)
-            return {"status": "error", "error": str(exc)}
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @router.post("/task/{ticket_id}/retry")
     async def retry_ticket(ticket_id: str):
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"status": "error", "error": "工单不存在"}
+            raise HTTPException(status_code=404, detail="工单不存在")
         if ticket["status"] not in ("failed", "completed"):
-            return {"status": "error", "error": f"当前状态 ({ticket['status']}) 不允许重试"}
+            raise HTTPException(status_code=400, detail=f"当前状态 ({ticket['status']}) 不允许重试")
 
         try:
             logger.info("重试工单: %s (原状态: %s)", ticket_id, ticket["status"])
@@ -144,13 +144,13 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             return {"status": "queued", "message": "工单已重新提交，正在排队处理"}
         except Exception as exc:
             logger.error("重试工单失败: %s", exc, exc_info=True)
-            return {"status": "error", "error": str(exc)}
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @router.post("/task/{ticket_id}/restore-local")
     async def restore_local_files(ticket_id: str):
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"status": "error", "error": "工单不存在"}
+            raise HTTPException(status_code=404, detail="工单不存在")
 
         ticket_dir = _PROJECT_ROOT / "data" / "users" / ticket["user_id"] / ticket_id
         restored = {"ticket_json": False, "reports": [], "products": 0}

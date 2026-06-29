@@ -58,21 +58,68 @@ def _fix_unescaped_inner_quotes(content: str) -> str:
                 in_string = True
         else:
             if ch == '\\' and i + 1 < n:
-                # 已有转义，原样保留
                 result.append(ch)
                 result.append(content[i + 1])
                 i += 1
             elif ch == '"':
-                # 判断：字符串结束符 vs 未转义的内部引号
                 rest = content[i + 1:]
                 stripped = rest.lstrip()
                 if not stripped or stripped[0] in ',:]}\r\n':
-                    # 后面是合法 JSON 续接 → 字符串结束
                     result.append('"')
                     in_string = False
                 else:
-                    # 后面不是合法续接 → 未转义内部引号
                     result.append('\\"')
+            else:
+                result.append(ch)
+
+        i += 1
+
+    return ''.join(result)
+
+
+def _fix_unescaped_inner_quotes_strict(content: str) -> str:
+    """严格版引号修复：当字符串值内含 { 或 [ 时（通常为嵌入的代码/JSON），
+    仅将 " 后跟 } 或 ] 视为合法字符串结束符，不再信任 , 和 : 。
+
+    解决大段代码内容嵌入 JSON 字符串时，内部 "key": "value", 模式被误判为外层 JSON 结构的问题。
+    """
+    result: list[str] = []
+    i = 0
+    in_string = False
+    n = len(content)
+    seen_structure = False
+
+    while i < n:
+        ch = content[i]
+
+        if not in_string:
+            result.append(ch)
+            if ch == '"':
+                in_string = True
+                seen_structure = False
+        else:
+            if ch == '\\' and i + 1 < n:
+                result.append(ch)
+                result.append(content[i + 1])
+                i += 1
+            elif ch == '{' or ch == '[':
+                result.append(ch)
+                seen_structure = True
+            elif ch == '"':
+                rest = content[i + 1:]
+                stripped = rest.lstrip()
+                if seen_structure:
+                    if stripped and stripped[0] in '}]':
+                        result.append('"')
+                        in_string = False
+                    else:
+                        result.append('\\"')
+                else:
+                    if not stripped or stripped[0] in ',:]}\r\n':
+                        result.append('"')
+                        in_string = False
+                    else:
+                        result.append('\\"')
             else:
                 result.append(ch)
 
@@ -98,6 +145,8 @@ def _parse_json_safe(content: str, _debug_label: str = "") -> dict | None:
         lambda c: json.loads(re.sub(r'(?m)^```(?:json)?\s*\n?|^\s*```\s*$', '', c).strip()),
         lambda c: json.loads(re.sub(r"(?<!\\)'", '"', c)),
         lambda c: _try_truncated_json(re.sub(r"(?<!\\)'", '"', c)),
+        lambda c: json.loads(_fix_unescaped_inner_quotes_strict(c)),
+        lambda c: _try_truncated_json(_fix_unescaped_inner_quotes_strict(c)),
     ]
     for _ in strategies:
         try:

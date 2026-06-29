@@ -63,13 +63,15 @@ def _fetch(url: str, extract_mode: str = "text", max_chars: int = 8000) -> str:
     if content_encoding == "gzip":
         try:
             raw_bytes = gzip.decompress(raw_bytes)
-        except Exception:
-            pass
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning("gzip decompression failed for %s: %s", url, e)
     elif content_encoding == "deflate":
         try:
             raw_bytes = gzip.decompress(raw_bytes)
-        except Exception:
-            pass
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning("deflate decompression failed for %s: %s", url, e)
 
     # 检测字符编码
     charset = "utf-8"

@@ -8,9 +8,14 @@ from typing import AsyncGenerator, Optional
 import httpx
 
 from .config import DifyConfig
-from ...core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _get_settings():
+    """延迟加载 Settings，避免循环导入（api.core.__init__ → lifespan → dify → core.config）。"""
+    from ...core.config import settings
+    return settings
 
 
 class CircuitState(Enum):
@@ -104,13 +109,14 @@ class DifyChatflowClient:
 
     def __init__(self, config: Optional[DifyConfig] = None):
         self.config = config or DifyConfig.from_env()
+        s = _get_settings()
         self._circuit = CircuitBreaker(
-            failure_threshold=settings.dify_circuit_failure_threshold,
-            window_seconds=settings.dify_circuit_window_seconds,
-            recovery_timeout=settings.dify_circuit_recovery_timeout,
+            failure_threshold=s.dify_circuit_failure_threshold,
+            window_seconds=s.dify_circuit_window_seconds,
+            recovery_timeout=s.dify_circuit_recovery_timeout,
         )
-        self._max_retries = settings.dify_max_retries
-        self._base_delay = settings.dify_base_delay
+        self._max_retries = s.dify_max_retries
+        self._base_delay = s.dify_base_delay
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_http_client(self, timeout: float = 60.0) -> httpx.AsyncClient:

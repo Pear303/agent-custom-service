@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from ..schemas.task import RequirementRequest
 from ..utils.progress import _calculate_progress, _check_local_status, _enrich_local_status
@@ -132,7 +133,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单详情，返回用户可读的摘要信息。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         progress = _calculate_progress(ticket["status"])
         status_label = _STATUS_LABELS.get(ticket["status"], ticket["status"])
@@ -187,7 +191,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单进度百分比和当前阶段描述。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         progress = _calculate_progress(ticket["status"])
         status_label = _STATUS_LABELS.get(ticket["status"], ticket["status"])
@@ -224,7 +231,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单的需求分析报告摘要。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         analysis = ticket.get("analysis")
         if not analysis:
@@ -271,7 +281,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单的PRD文档摘要。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         prd = ticket.get("prd")
         if not prd:
@@ -318,7 +331,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单的报价单摘要。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         quote = ticket.get("quote")
         if not quote:
@@ -365,7 +381,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
         """查询工单的开发产出摘要（文件列表、技术栈等）。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         dev_output = ticket.get("development_output")
         if not dev_output:
@@ -450,7 +469,7 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             }
         except Exception as exc:
             logger.error("创建工单失败: %s", exc, exc_info=True)
-            return {"success": False, "message": f"创建工单失败：{str(exc)}"}
+            raise HTTPException(status_code=500, detail=f"创建工单失败：{str(exc)}")
 
     @router.post("/ticket/start-development")
     async def start_development(ticket_id: str):
@@ -459,7 +478,10 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
 
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         if ticket["status"] not in ("pending_development", "development_failed"):
             status_label = _STATUS_LABELS.get(ticket["status"], ticket["status"])
@@ -500,14 +522,17 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             }
         except Exception as exc:
             logger.error("启动开发失败: %s", exc, exc_info=True)
-            return {"success": False, "message": f"启动开发失败：{str(exc)}"}
+            raise HTTPException(status_code=500, detail=f"启动开发失败：{str(exc)}")
 
     @router.post("/ticket/retry")
     async def retry_ticket(ticket_id: str):
         """重试失败或已完成的工单。"""
         ticket = await db.get_ticket(ticket_id)
         if not ticket:
-            return {"success": False, "message": f"工单 {ticket_id} 不存在"}
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"工单 {ticket_id} 不存在"},
+            )
 
         if ticket["status"] not in ("failed", "completed"):
             status_label = _STATUS_LABELS.get(ticket["status"], ticket["status"])
@@ -535,7 +560,7 @@ def create_router(db, agent_service, task_queue) -> APIRouter:
             }
         except Exception as exc:
             logger.error("重试工单失败: %s", exc, exc_info=True)
-            return {"success": False, "message": f"重试工单失败：{str(exc)}"}
+            raise HTTPException(status_code=500, detail=f"重试工单失败：{str(exc)}")
 
     @router.get("/user/summary")
     async def get_user_summary(

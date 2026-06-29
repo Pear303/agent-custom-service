@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import platform
 import sys
 from pathlib import Path
@@ -15,6 +16,8 @@ from .skills import SkillsLoader
 
 if TYPE_CHECKING:
     from .memory import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 
 def _get_os_info() -> str:
@@ -59,7 +62,8 @@ class ContextBuilder:
         try:
             template = self._env.get_template(template_name)
             return template.render(**kwargs)
-        except Exception:
+        except Exception as e:
+            logger.error("Failed to render template '%s': %s", template_name, e)
             return ""
 
     def build_system_prompt(self) -> str:

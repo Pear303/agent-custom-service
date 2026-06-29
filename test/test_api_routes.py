@@ -233,9 +233,9 @@ class TestTaskRoutes:
         self.mocks["db"].get_ticket = AsyncMock(return_value=None)
 
         resp = self.client.get("/task/TKT-NONEXIST/status")
-        assert resp.status_code == 200
+        assert resp.status_code == 404
         data = resp.json()
-        assert "error" in data
+        assert "detail" in data
 
     def test_list_tickets(self):
         """GET /task/list 正常查询。"""
@@ -255,6 +255,6 @@ class TestTaskRoutes:
         })
 
         resp = self.client.post("/task/TKT-01/start-development")
-        assert resp.status_code == 200
+        assert resp.status_code == 400
         data = resp.json()
-        assert "error" in data
+        assert "detail" in data

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -23,8 +25,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# 关闭 uvicorn 的 HTTP 请求访问日志（形如 "INFO: 127.0.0.1 - GET /xxx HTTP/1.1 200 OK"）
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """为每个请求注入 X-Request-ID，便于跨日志追踪。"""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 # ── 服务实例化 ──────────────────────────────────────────────
 db = Database()
@@ -52,6 +64,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RateLimitMiddleware, requests_per_minute=60, burst=10)
 
 # ── 路由挂载 ────────────────────────────────────────────────

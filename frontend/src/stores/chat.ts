@@ -63,9 +63,8 @@ export const useChatStore = defineStore('chat', () => {
     messages.value = history
   }
 
-  /** 后端 AgentService 已自动保存 history，前端无需主动同步 */
-  function saveHistory() {
-  }
+  /** @deprecated 后端 AgentService 已自动保存历史，前端无需主动调用。保留导出以兼容旧代码。 */
+  function saveHistory() {}
 
   /** 清空当前会话 → 保存到历史列表 → 重置后端 session */
   async function reset(userId: string) {

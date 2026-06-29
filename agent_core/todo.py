@@ -4,6 +4,10 @@
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 _VALID_STATUS = ("pending", "in_progress", "completed")
 _STATUS_ICON = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
@@ -124,16 +128,15 @@ class TodoStore:
             parts.append(f"{n_pending}项待办")
         summary_line = " · ".join(parts) if parts else "0项"
 
-        print(f"\n{'='*40}")
-        print(f"  计划进度  |  {summary_line}")
+        logger.debug("\n%s", "=" * 40)
+        logger.debug("  计划进度  |  %s", summary_line)
         if current:
-            print(f"  当前执行  |  {current}")
-        print(f"{'='*40}")
+            logger.debug("  当前执行  |  %s", current)
+        logger.debug("%s", "=" * 40)
         if cleaned:
-            print(_render(self.todos))
+            logger.debug("%s", _render(self.todos))
         if dropped:
-            print(f"  ({dropped} 项因缺少内容被跳过)")
-        print()
+            logger.debug("  (%s 项因缺少内容被跳过)", dropped)
 
         summary = (
             f"todos updated: total={len(self.todos)}, completed={n_completed}, "

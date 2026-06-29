@@ -24,9 +24,7 @@ const sourceLabel = computed(() => {
 })
 
 const timestampLabel = computed(() => {
-  console.log('timestampLabel 执行了, timestamp=', props.message.timestamp, '类型=', typeof props.message.timestamp)
   if (!props.message.timestamp) {
-    console.log('timestamp 是 falsy 值，不显示')
     return ''
   }
 

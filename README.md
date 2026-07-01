@@ -25,10 +25,13 @@ cd ..
 
 # 启动服务 → http://localhost:8000
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+# 启动服务 → http://localhost:8000
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 前端开发模式（另开终端）
 cd frontend; npm run dev   # Vite → http://localhost:5173
 $env:DEV_MODE="true"
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 或使用 CLI 交互模式
@@ -270,6 +273,39 @@ npx clawhub install word-docx         # Word 文档
 | `SERVICE_PORT` | `8000` | 服务监听端口 |
 | `SESSION_TIMEOUT_MINUTES` | `30` | 会话超时时间（分钟） |
 | `MAX_SESSIONS` | `1000` | 最大并发会话数 |
+
+## Docker 部署
+
+```bash
+docker-compose up -d
+# 服务运行在 http://localhost:8000
+```
+
+## 技术栈
+
+| 层 | 技术 |
+|----|------|
+| Agent 引擎 | LangGraph + LangChain Core |
+| LLM | DeepSeek / 智谱 AI |
+| 后端框架 | FastAPI + SSE 流式 |
+| 数据存储 | SQLite (aiosqlite) |
+| 向量存储 | ChromaDB |
+| RAG | sentence-transformers |
+| 前端 | Vue 3 + Pinia + Vue Router + Vite |
+
+## 运行测试
+
+```bash
+pytest test/ -v
+```
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。请确保代码通过现有测试。
 
 ## Docker 部署
 
